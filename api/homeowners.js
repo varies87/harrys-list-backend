@@ -20,6 +20,16 @@ const { createClient } = require("@supabase/supabase-js");
 
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SECRET_KEY);
 
+/**
+ * See the matching comment in quotes.js -- ids are int8 (numbers) in the
+ * database, but always arrive as strings from the frontend over JSON.
+ */
+function toId(value) {
+  if (value === null || value === undefined || value === "") return value;
+  const n = Number(value);
+  return Number.isNaN(n) ? value : n;
+}
+
 function rowToHomeowner(row) {
   return {
     id: row.id,
@@ -73,7 +83,7 @@ async function updateHomeowner(homeownerId, updates) {
   if (updates.name !== undefined) row.name = updates.name;
   if (updates.zip !== undefined) row.zip = updates.zip;
 
-  const { data, error } = await supabase.from("homeowners").update(row).eq("id", homeownerId).select().single();
+  const { data, error } = await supabase.from("homeowners").update(row).eq("id", toId(homeownerId)).select().single();
   if (error) throw new Error("Could not update homeowner: " + error.message);
   return rowToHomeowner(data);
 }
@@ -82,20 +92,26 @@ async function toggleFavorite(homeownerId, contractorId) {
   const { data: current, error: fetchError } = await supabase
     .from("homeowners")
     .select("favorite_contractor_ids")
-    .eq("id", homeownerId)
+    .eq("id", toId(homeownerId))
     .single();
   if (fetchError) throw new Error("Could not find homeowner: " + fetchError.message);
 
+  // favorite_contractor_ids is stored as a comma-separated string of
+  // contractor ids. Compare everything as strings here (not toId) since
+  // we're matching against text split out of a text column, not querying
+  // the database directly -- the goal is just consistent comparison, and
+  // String() on both sides is simpler than converting back and forth.
   const currentIds = current.favorite_contractor_ids
     ? current.favorite_contractor_ids.split(",").filter(Boolean)
     : [];
-  const isFavorite = currentIds.includes(contractorId);
-  const nextIds = isFavorite ? currentIds.filter((id) => id !== contractorId) : [...currentIds, contractorId];
+  const contractorIdStr = String(contractorId);
+  const isFavorite = currentIds.includes(contractorIdStr);
+  const nextIds = isFavorite ? currentIds.filter((id) => id !== contractorIdStr) : [...currentIds, contractorIdStr];
 
   const { data, error } = await supabase
     .from("homeowners")
     .update({ favorite_contractor_ids: nextIds.join(",") })
-    .eq("id", homeownerId)
+    .eq("id", toId(homeownerId))
     .select()
     .single();
   if (error) throw new Error("Could not update favorites: " + error.message);
