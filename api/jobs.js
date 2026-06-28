@@ -32,6 +32,17 @@ const { createClient } = require("@supabase/supabase-js");
 
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SECRET_KEY);
 
+/**
+ * See the matching comment in quotes.js -- every id column here is int8,
+ * not uuid, so ids must be converted to numbers before being used in a
+ * query. IDs arrive as strings from the frontend over JSON.
+ */
+function toId(value) {
+  if (value === null || value === undefined || value === "") return value;
+  const n = Number(value);
+  return Number.isNaN(n) ? value : n;
+}
+
 function rowToJob(row) {
   return {
     id: row.id,
@@ -53,9 +64,9 @@ async function reportJob({ contractorId, quoteRequestId, homeownerId, descriptio
   const { data, error } = await supabase
     .from("completed_jobs")
     .insert({
-      contractor_id: contractorId,
-      quote_request_id: quoteRequestId,
-      homeowner_id: homeownerId,
+      contractor_id: toId(contractorId),
+      quote_request_id: toId(quoteRequestId),
+      homeowner_id: toId(homeownerId),
       description,
       reported_amount: reportedAmount,
       status: "pending_confirmation",
@@ -71,7 +82,7 @@ async function listJobsForContractor(contractorId) {
   const { data, error } = await supabase
     .from("completed_jobs")
     .select("*")
-    .eq("contractor_id", contractorId)
+    .eq("contractor_id", toId(contractorId))
     .order("created_at", { ascending: false });
   if (error) throw new Error("Could not list jobs: " + error.message);
   return data.map(rowToJob);
@@ -81,7 +92,7 @@ async function listJobsForHomeowner(homeownerId) {
   const { data, error } = await supabase
     .from("completed_jobs")
     .select("*")
-    .eq("homeowner_id", homeownerId)
+    .eq("homeowner_id", toId(homeownerId))
     .order("created_at", { ascending: false });
   if (error) throw new Error("Could not list jobs: " + error.message);
   return data.map(rowToJob);
@@ -91,7 +102,7 @@ async function confirmJob(jobId) {
   const { data, error } = await supabase
     .from("completed_jobs")
     .update({ status: "confirmed", confirmed_at: new Date().toISOString() })
-    .eq("id", jobId)
+    .eq("id", toId(jobId))
     .select()
     .single();
   if (error) throw new Error("Could not confirm job: " + error.message);
@@ -102,7 +113,7 @@ async function disputeJob(jobId, note) {
   const { data, error } = await supabase
     .from("completed_jobs")
     .update({ status: "disputed", dispute_note: note || "Homeowner disputed this amount." })
-    .eq("id", jobId)
+    .eq("id", toId(jobId))
     .select()
     .single();
   if (error) throw new Error("Could not dispute job: " + error.message);
@@ -113,7 +124,7 @@ async function markJobPaid(jobId) {
   const { data, error } = await supabase
     .from("completed_jobs")
     .update({ status: "paid", fee_paid: true, fee_paid_at: new Date().toISOString() })
-    .eq("id", jobId)
+    .eq("id", toId(jobId))
     .select()
     .single();
   if (error) throw new Error("Could not mark job paid: " + error.message);
