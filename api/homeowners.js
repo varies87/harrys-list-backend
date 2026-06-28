@@ -15,11 +15,11 @@
  *   SUPABASE_SECRET_KEY
  * ---------------------------------------------------------------------------
  */
- 
+
 const { createClient } = require("@supabase/supabase-js");
- 
+
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SECRET_KEY);
- 
+
 function rowToHomeowner(row) {
   return {
     id: row.id,
@@ -31,7 +31,7 @@ function rowToHomeowner(row) {
       : [],
   };
 }
- 
+
 /**
  * Signs in to an existing homeowner account if the email matches one already
  * in the database, otherwise creates a new one. This mirrors the original
@@ -40,19 +40,19 @@ function rowToHomeowner(row) {
  */
 async function authenticateHomeowner(name, email, zip) {
   const normalizedEmail = email.trim().toLowerCase();
- 
+
   const { data: existing, error: lookupError } = await supabase
     .from("homeowners")
     .select("*")
     .ilike("email", normalizedEmail)
     .maybeSingle();
- 
+
   if (lookupError) throw new Error("Could not look up homeowner: " + lookupError.message);
- 
+
   if (existing) {
     return rowToHomeowner(existing);
   }
- 
+
   const { data: created, error: createError } = await supabase
     .from("homeowners")
     .insert({
@@ -63,21 +63,21 @@ async function authenticateHomeowner(name, email, zip) {
     })
     .select()
     .single();
- 
+
   if (createError) throw new Error("Could not create homeowner: " + createError.message);
   return rowToHomeowner(created);
 }
- 
+
 async function updateHomeowner(homeownerId, updates) {
   const row = {};
   if (updates.name !== undefined) row.name = updates.name;
   if (updates.zip !== undefined) row.zip = updates.zip;
- 
+
   const { data, error } = await supabase.from("homeowners").update(row).eq("id", homeownerId).select().single();
   if (error) throw new Error("Could not update homeowner: " + error.message);
   return rowToHomeowner(data);
 }
- 
+
 async function toggleFavorite(homeownerId, contractorId) {
   const { data: current, error: fetchError } = await supabase
     .from("homeowners")
@@ -85,13 +85,13 @@ async function toggleFavorite(homeownerId, contractorId) {
     .eq("id", homeownerId)
     .single();
   if (fetchError) throw new Error("Could not find homeowner: " + fetchError.message);
- 
+
   const currentIds = current.favorite_contractor_ids
     ? current.favorite_contractor_ids.split(",").filter(Boolean)
     : [];
   const isFavorite = currentIds.includes(contractorId);
   const nextIds = isFavorite ? currentIds.filter((id) => id !== contractorId) : [...currentIds, contractorId];
- 
+
   const { data, error } = await supabase
     .from("homeowners")
     .update({ favorite_contractor_ids: nextIds.join(",") })
@@ -101,10 +101,10 @@ async function toggleFavorite(homeownerId, contractorId) {
   if (error) throw new Error("Could not update favorites: " + error.message);
   return rowToHomeowner(data);
 }
- 
+
 async function handleHomeownersRequest(body) {
   const { action } = body || {};
- 
+
   try {
     if (action === "authenticate") {
       if (!body.name || !body.email || !body.zip) {
@@ -113,7 +113,7 @@ async function handleHomeownersRequest(body) {
       const homeowner = await authenticateHomeowner(body.name, body.email, body.zip);
       return { statusCode: 200, body: { homeowner } };
     }
- 
+
     if (action === "update") {
       if (!body.homeownerId) {
         return { statusCode: 400, body: { error: "homeownerId is required." } };
@@ -121,7 +121,7 @@ async function handleHomeownersRequest(body) {
       const homeowner = await updateHomeowner(body.homeownerId, body.updates || {});
       return { statusCode: 200, body: { homeowner } };
     }
- 
+
     if (action === "toggleFavorite") {
       if (!body.homeownerId || !body.contractorId) {
         return { statusCode: 400, body: { error: "homeownerId and contractorId are required." } };
@@ -129,15 +129,24 @@ async function handleHomeownersRequest(body) {
       const homeowner = await toggleFavorite(body.homeownerId, body.contractorId);
       return { statusCode: 200, body: { homeowner } };
     }
- 
+
     return { statusCode: 400, body: { error: `Unknown action: ${action}` } };
   } catch (err) {
     console.error("homeowners handler error:", err);
     return { statusCode: 500, body: { error: err.message } };
   }
 }
- 
+
 module.exports = async function handler(req, res) {
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+
+  if (req.method === "OPTIONS") {
+    res.status(200).end();
+    return;
+  }
+
   if (req.method !== "POST") {
     res.status(405).json({ error: "Method not allowed" });
     return;
@@ -145,6 +154,6 @@ module.exports = async function handler(req, res) {
   const result = await handleHomeownersRequest(req.body);
   res.status(result.statusCode).json(result.body);
 };
- 
+
 module.exports.handleHomeownersRequest = handleHomeownersRequest;
 module.exports.rowToHomeowner = rowToHomeowner;
