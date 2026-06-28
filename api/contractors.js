@@ -33,6 +33,7 @@ const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SEC
 function rowToContractor(row) {
   return {
     id: row.id,
+    createdAt: row.created_at,
     businessName: row.business_name,
     trade: row.trade,
     yearsInBusiness: row.years_in_business,
