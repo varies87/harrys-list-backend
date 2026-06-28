@@ -39,6 +39,16 @@ const stripe = new Stripe(process.env.STRIPE_SECRET_KEY, {
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SECRET_KEY);
 
 /**
+ * Ids are int8 (numbers) in the database, but arrive as strings from the
+ * frontend over JSON. See the matching comment in api/quotes.js.
+ */
+function toId(value) {
+  if (value === null || value === undefined || value === "") return value;
+  const n = Number(value);
+  return Number.isNaN(n) ? value : n;
+}
+
+/**
  * Re-derives the platform fee owed for a job amount, using the SAME marginal
  * bracket logic as the frontend (feeOwedForAmount in App.jsx). This duplication
  * is intentional: the server computes its own answer rather than trusting any
@@ -76,7 +86,7 @@ async function getJobReportedAmount(jobId) {
   const { data, error } = await supabase
     .from("completed_jobs")
     .select("reported_amount, status, fee_paid")
-    .eq("id", jobId)
+    .eq("id", toId(jobId))
     .single();
 
   if (error || !data) {
@@ -169,5 +179,4 @@ module.exports = async function handler(req, res) {
 // Exported for testing.
 module.exports.feeOwedForAmount = feeOwedForAmount;
 module.exports.handleCreatePaymentIntent = handleCreatePaymentIntent;
-module.exports.getJobReportedAmount = getJobReportedAmount;entIntent;
 module.exports.getJobReportedAmount = getJobReportedAmount;
