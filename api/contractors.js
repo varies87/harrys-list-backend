@@ -56,7 +56,12 @@ function contractorToRow(contractor) {
   if (contractor.serviceArea !== undefined) {
     row.service_area_mode = contractor.serviceArea.mode;
     const zips = contractor.serviceArea.zipCodes;
-    row.service_area_zips = zips ? (Array.isArray(zips) ? zips.join(",") : [...zips].join(",")) : "";
+    // Defensive: a Set sent from a client silently becomes {} once it
+    // crosses JSON (JSON.stringify(new Set()) === "{}"), which is not
+    // iterable and would crash a naive [...zips]. The frontend should
+    // always send a plain array, but never trust that blindly here --
+    // fall back to an empty list for anything that isn't a real array.
+    row.service_area_zips = Array.isArray(zips) ? zips.join(",") : "";
   }
   if (contractor.status !== undefined) row.status = contractor.status;
   if (contractor.thumbsUp !== undefined) row.thumbs_up = contractor.thumbsUp;
@@ -187,5 +192,4 @@ module.exports = async function handler(req, res) {
 // Exported for testing.
 module.exports.handleContractorsRequest = handleContractorsRequest;
 module.exports.rowToContractor = rowToContractor;
-module.exports.contractorToRow = contractorToRow;
 module.exports.contractorToRow = contractorToRow;
