@@ -1,4 +1,4 @@
-**
+/**
  * api/contractors.js
  * ---------------------------------------------------------------------------
  * Backend endpoint for everything contractor-related: listing approved
