@@ -29,6 +29,16 @@ const { createClient } = require("@supabase/supabase-js");
 
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SECRET_KEY);
 
+/**
+ * See the matching comment in quotes.js -- ids are int8 (numbers) in the
+ * database, but always arrive as strings from the frontend over JSON.
+ */
+function toId(value) {
+  if (value === null || value === undefined || value === "") return value;
+  const n = Number(value);
+  return Number.isNaN(n) ? value : n;
+}
+
 /** Converts a DB row (snake_case) into the shape the frontend expects (camelCase, with service area as a Set-friendly array). */
 function rowToContractor(row) {
   return {
@@ -126,7 +136,7 @@ async function createContractor(contractor) {
 
 async function updateContractor(contractorId, updates) {
   const row = contractorToRow(updates);
-  const { data, error } = await supabase.from("contractors").update(row).eq("id", contractorId).select().single();
+  const { data, error } = await supabase.from("contractors").update(row).eq("id", toId(contractorId)).select().single();
   if (error) throw new Error("Could not update contractor: " + error.message);
   return rowToContractor(data);
 }
@@ -152,7 +162,7 @@ async function uploadLogo(contractorId, fileBase64, fileName, contentType) {
   const { data, error } = await supabase
     .from("contractors")
     .update({ logo_url: logoUrl })
-    .eq("id", contractorId)
+    .eq("id", toId(contractorId))
     .select()
     .single();
   if (error) throw new Error("Could not save logo URL: " + error.message);
