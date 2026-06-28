@@ -22,6 +22,25 @@ const { createClient } = require("@supabase/supabase-js");
 
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SECRET_KEY);
 
+/**
+ * Every id column in this database (homeowners.id, contractors.id,
+ * quote_requests.id, etc.) is int8 (a plain number), since that's what
+ * Supabase creates by default for a brand-new table -- not a uuid. IDs
+ * arriving from the frontend over JSON are always strings (JSON has no way
+ * to guarantee a number stays a number across an HTTP boundary the way the
+ * frontend originally typed it). Comparing a string against an int8 column
+ * with .eq() can silently fail to match depending on which part of the
+ * query layer does the comparison -- which is exactly what caused quote
+ * requests to come back with no recipients, and listForHomeowner to return
+ * every homeowner's requests instead of just one. Always convert through
+ * this function before using an id in a query.
+ */
+function toId(value) {
+  if (value === null || value === undefined || value === "") return value;
+  const n = Number(value);
+  return Number.isNaN(n) ? value : n;
+}
+
 function rowToRecipient(row) {
   return {
     contractorId: row.contractor_id,
@@ -55,14 +74,14 @@ function rowToQuoteRequest(row, recipients) {
 async function createQuoteRequest({ homeownerId, description, budget, timeline, zip, contractorIds }) {
   const { data: qr, error: qrError } = await supabase
     .from("quote_requests")
-    .insert({ homeowner_id: homeownerId, description, budget, timeline, zip })
+    .insert({ homeowner_id: toId(homeownerId), description, budget, timeline, zip })
     .select()
     .single();
   if (qrError) throw new Error("Could not create quote request: " + qrError.message);
 
   const recipientRows = contractorIds.map((contractorId) => ({
     quote_request_id: qr.id,
-    contractor_id: contractorId,
+    contractor_id: toId(contractorId),
     status: "sent",
   }));
 
@@ -79,7 +98,7 @@ async function listQuoteRequestsForHomeowner(homeownerId) {
   const { data: requests, error: reqError } = await supabase
     .from("quote_requests")
     .select("*")
-    .eq("homeowner_id", homeownerId)
+    .eq("homeowner_id", toId(homeownerId))
     .order("created_at", { ascending: false });
   if (reqError) throw new Error("Could not list quote requests: " + reqError.message);
 
@@ -90,7 +109,7 @@ async function listQuoteRequestsForContractor(contractorId) {
   const { data: recipientRows, error: recError } = await supabase
     .from("quote_recipients")
     .select("quote_request_id")
-    .eq("contractor_id", contractorId);
+    .eq("contractor_id", toId(contractorId));
   if (recError) throw new Error("Could not list recipient rows: " + recError.message);
 
   const requestIds = [...new Set(recipientRows.map((r) => r.quote_request_id))];
@@ -109,7 +128,7 @@ async function listQuoteRequestsForContractor(contractorId) {
 /** Shared helper: given a list of quote_requests rows, fetch and attach their recipients. */
 async function attachRecipients(requests) {
   if (requests.length === 0) return [];
-  const requestIds = requests.map((r) => r.id);
+  const requestIds = requests.map((r) => toId(r.id));
   const { data: allRecipients, error } = await supabase
     .from("quote_recipients")
     .select("*")
@@ -117,7 +136,7 @@ async function attachRecipients(requests) {
   if (error) throw new Error("Could not list recipients: " + error.message);
 
   return requests.map((r) =>
-    rowToQuoteRequest(r, allRecipients.filter((rec) => rec.quote_request_id === r.id))
+    rowToQuoteRequest(r, allRecipients.filter((rec) => toId(rec.quote_request_id) === toId(r.id)))
   );
 }
 
@@ -131,8 +150,8 @@ async function respondToQuote(quoteRequestId, contractorId, status, price, messa
   const { error } = await supabase
     .from("quote_recipients")
     .update(updates)
-    .eq("quote_request_id", quoteRequestId)
-    .eq("contractor_id", contractorId);
+    .eq("quote_request_id", toId(quoteRequestId))
+    .eq("contractor_id", toId(contractorId));
   if (error) throw new Error("Could not update quote response: " + error.message);
 
   return { success: true };
@@ -142,8 +161,8 @@ async function markJobReported(quoteRequestId, contractorId) {
   const { error } = await supabase
     .from("quote_recipients")
     .update({ job_reported: true })
-    .eq("quote_request_id", quoteRequestId)
-    .eq("contractor_id", contractorId);
+    .eq("quote_request_id", toId(quoteRequestId))
+    .eq("contractor_id", toId(contractorId));
   if (error) throw new Error("Could not mark job reported: " + error.message);
   return { success: true };
 }
