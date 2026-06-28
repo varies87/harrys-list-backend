@@ -18,11 +18,11 @@
  *   SUPABASE_SECRET_KEY
  * ---------------------------------------------------------------------------
  */
- 
+
 const { createClient } = require("@supabase/supabase-js");
- 
+
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SECRET_KEY);
- 
+
 /** Converts a DB row (snake_case) into the shape the frontend expects (camelCase, with service area as a Set-friendly array). */
 function rowToContractor(row) {
   return {
@@ -44,7 +44,7 @@ function rowToContractor(row) {
     reviews: [], // reserved for a future reviews table
   };
 }
- 
+
 /** Converts the frontend's contractor shape into DB columns for insert/update. */
 function contractorToRow(contractor) {
   const row = {};
@@ -64,27 +64,27 @@ function contractorToRow(contractor) {
   if (contractor.logoUrl !== undefined) row.logo_url = contractor.logoUrl;
   return row;
 }
- 
+
 async function listContractors() {
   const { data, error } = await supabase.from("contractors").select("*").order("created_at", { ascending: false });
   if (error) throw new Error("Could not list contractors: " + error.message);
   return data.map(rowToContractor);
 }
- 
+
 async function createContractor(contractor) {
   const row = contractorToRow({ ...contractor, status: contractor.status || "pending" });
   const { data, error } = await supabase.from("contractors").insert(row).select().single();
   if (error) throw new Error("Could not create contractor: " + error.message);
   return rowToContractor(data);
 }
- 
+
 async function updateContractor(contractorId, updates) {
   const row = contractorToRow(updates);
   const { data, error } = await supabase.from("contractors").update(row).eq("id", contractorId).select().single();
   if (error) throw new Error("Could not update contractor: " + error.message);
   return rowToContractor(data);
 }
- 
+
 /**
  * Uploads a logo image to Supabase Storage and saves its public URL onto
  * the contractor's row. fileBase64 should be a base64-encoded image (without
@@ -94,15 +94,15 @@ async function updateContractor(contractorId, updates) {
 async function uploadLogo(contractorId, fileBase64, fileName, contentType) {
   const buffer = Buffer.from(fileBase64, "base64");
   const path = `${contractorId}/${Date.now()}-${fileName}`;
- 
+
   const { error: uploadError } = await supabase.storage
     .from("contractor-logos")
     .upload(path, buffer, { contentType, upsert: true });
   if (uploadError) throw new Error("Could not upload logo: " + uploadError.message);
- 
+
   const { data: publicUrlData } = supabase.storage.from("contractor-logos").getPublicUrl(path);
   const logoUrl = publicUrlData.publicUrl;
- 
+
   const { data, error } = await supabase
     .from("contractors")
     .update({ logo_url: logoUrl })
@@ -110,19 +110,19 @@ async function uploadLogo(contractorId, fileBase64, fileName, contentType) {
     .select()
     .single();
   if (error) throw new Error("Could not save logo URL: " + error.message);
- 
+
   return rowToContractor(data);
 }
- 
+
 async function handleContractorsRequest(body) {
   const { action } = body || {};
- 
+
   try {
     if (action === "list") {
       const contractors = await listContractors();
       return { statusCode: 200, body: { contractors } };
     }
- 
+
     if (action === "create") {
       if (!body.contractor || !body.contractor.businessName) {
         return { statusCode: 400, body: { error: "contractor.businessName is required." } };
@@ -130,7 +130,7 @@ async function handleContractorsRequest(body) {
       const contractor = await createContractor(body.contractor);
       return { statusCode: 200, body: { contractor } };
     }
- 
+
     if (action === "update") {
       if (!body.contractorId) {
         return { statusCode: 400, body: { error: "contractorId is required." } };
@@ -138,7 +138,7 @@ async function handleContractorsRequest(body) {
       const contractor = await updateContractor(body.contractorId, body.updates || {});
       return { statusCode: 200, body: { contractor } };
     }
- 
+
     if (action === "uploadLogo") {
       if (!body.contractorId || !body.fileBase64 || !body.fileName) {
         return { statusCode: 400, body: { error: "contractorId, fileBase64, and fileName are required." } };
@@ -151,15 +151,31 @@ async function handleContractorsRequest(body) {
       );
       return { statusCode: 200, body: { contractor } };
     }
- 
+
     return { statusCode: 400, body: { error: `Unknown action: ${action}` } };
   } catch (err) {
     console.error("contractors handler error:", err);
     return { statusCode: 500, body: { error: err.message } };
   }
 }
- 
+
 module.exports = async function handler(req, res) {
+  // CORS: allow this function to be called from any origin, including the
+  // sandboxed iframe Claude's artifact viewer runs the frontend in. Without
+  // these headers, browsers block the request before it even reaches this
+  // code, often showing a generic "Load failed" or "Failed to fetch" error
+  // with no further detail.
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+
+  // Browsers send a preflight OPTIONS request before the real POST to ask
+  // "are you okay with this?" -- must answer it directly, not run real logic.
+  if (req.method === "OPTIONS") {
+    res.status(200).end();
+    return;
+  }
+
   if (req.method !== "POST") {
     res.status(405).json({ error: "Method not allowed" });
     return;
@@ -167,8 +183,9 @@ module.exports = async function handler(req, res) {
   const result = await handleContractorsRequest(req.body);
   res.status(result.statusCode).json(result.body);
 };
- 
+
 // Exported for testing.
 module.exports.handleContractorsRequest = handleContractorsRequest;
 module.exports.rowToContractor = rowToContractor;
+module.exports.contractorToRow = contractorToRow;
 module.exports.contractorToRow = contractorToRow;
