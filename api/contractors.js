@@ -12,10 +12,16 @@
  *   POST /api/contractors  { action: "create", contractor: {...} }
  *   POST /api/contractors  { action: "update", contractorId, updates: {...} }
  *   POST /api/contractors  { action: "uploadLogo", contractorId, fileBase64, fileName }
+ *   POST /api/contractors  { action: "listPending", adminPassword }
+ *   POST /api/contractors  { action: "setStatus", adminPassword, contractorId, status }
  *
  * ENVIRONMENT VARIABLES (same ones already set in Vercel for the payment function)
  *   SUPABASE_URL
  *   SUPABASE_SECRET_KEY
+ *   ADMIN_PASSWORD   -- a password of your choosing, checked against the
+ *                       "adminPassword" field on listPending/setStatus
+ *                       requests. Set this in Vercel project settings, same
+ *                       place as the other secrets -- never in code.
  * ---------------------------------------------------------------------------
  */
 
@@ -74,6 +80,40 @@ async function listContractors() {
   const { data, error } = await supabase.from("contractors").select("*").order("created_at", { ascending: false });
   if (error) throw new Error("Could not list contractors: " + error.message);
   return data.map(rowToContractor);
+}
+
+/**
+ * Returns ONLY contractors with status "pending" -- used by the admin
+ * approval screen. Requires the correct admin password (see
+ * checkAdminPassword below) since this could otherwise be used to see
+ * every pending signup, including ones not yet vetted.
+ */
+async function listPendingContractors() {
+  const { data, error } = await supabase
+    .from("contractors")
+    .select("*")
+    .eq("status", "pending")
+    .order("created_at", { ascending: false });
+  if (error) throw new Error("Could not list pending contractors: " + error.message);
+  return data.map(rowToContractor);
+}
+
+/**
+ * Checks a password against ADMIN_PASSWORD, an environment variable set
+ * directly in Vercel (never in code, same pattern as the Stripe/Supabase
+ * secret keys). Returns true/false -- callers are responsible for returning
+ * a 401 if this is false. This is intentionally simple (a single shared
+ * password, not real per-admin accounts) since this is a one-person
+ * operation right now; revisit if more than one person needs admin access.
+ */
+function checkAdminPassword(password) {
+  const realPassword = process.env.ADMIN_PASSWORD;
+  if (!realPassword) {
+    // Fail closed: if the env var was never set, nobody should be able to
+    // get in by guessing an empty string or similar.
+    return false;
+  }
+  return password === realPassword;
 }
 
 async function createContractor(contractor) {
@@ -154,6 +194,28 @@ async function handleContractorsRequest(body) {
         body.fileName,
         body.contentType || "image/png"
       );
+      return { statusCode: 200, body: { contractor } };
+    }
+
+    if (action === "listPending") {
+      if (!checkAdminPassword(body.adminPassword)) {
+        return { statusCode: 401, body: { error: "Incorrect admin password." } };
+      }
+      const contractors = await listPendingContractors();
+      return { statusCode: 200, body: { contractors } };
+    }
+
+    if (action === "setStatus") {
+      if (!checkAdminPassword(body.adminPassword)) {
+        return { statusCode: 401, body: { error: "Incorrect admin password." } };
+      }
+      if (!body.contractorId || !body.status) {
+        return { statusCode: 400, body: { error: "contractorId and status are required." } };
+      }
+      if (body.status !== "approved" && body.status !== "rejected") {
+        return { statusCode: 400, body: { error: "status must be 'approved' or 'rejected'." } };
+      }
+      const contractor = await updateContractor(body.contractorId, { status: body.status });
       return { statusCode: 200, body: { contractor } };
     }
 
