@@ -148,48 +148,78 @@ async function markJobReported(quoteRequestId, contractorId) {
   return { success: true };
 }
 
-async function handleQuotesRequest(body) {
+async function getAuthedUser(req) {
+  const authHeader = req.headers["authorization"] || req.headers["Authorization"];
+  if (!authHeader || !authHeader.startsWith("Bearer ")) return null;
+  const token = authHeader.slice("Bearer ".length);
+  const { data, error } = await supabase.auth.getUser(token);
+  if (error || !data?.user) return null;
+  return { id: data.user.id, email: data.user.email };
+}
+
+async function getProfileIds(authUserId) {
+  const [homeownerRes, contractorRes] = await Promise.allSettled([
+    supabase.from("homeowners").select("id").eq("auth_user_id", authUserId).maybeSingle(),
+    supabase.from("contractors").select("id").eq("auth_user_id", authUserId).maybeSingle(),
+  ]);
+  return {
+    homeownerId: homeownerRes.status === "fulfilled" ? homeownerRes.value?.data?.id ?? null : null,
+    contractorId: contractorRes.status === "fulfilled" ? contractorRes.value?.data?.id ?? null : null,
+  };
+}
+
+async function handleQuotesRequest(body, req) {
   const { action } = body || {};
 
   try {
+    const authUser = await getAuthedUser(req);
+    if (!authUser) {
+      return { statusCode: 401, body: { error: "You must be signed in." } };
+    }
+
+    const { homeownerId, contractorId } = await getProfileIds(authUser.id);
+
     if (action === "create") {
-      const { homeownerId, description, contractorIds } = body;
-      if (!homeownerId || !description || !contractorIds || contractorIds.length === 0) {
-        return {
-          statusCode: 400,
-          body: { error: "homeownerId, description, and at least one contractorId are required." },
-        };
+      if (!homeownerId) return { statusCode: 403, body: { error: "No homeowner profile found for this account." } };
+      const { description, contractorIds } = body;
+      if (!description || !contractorIds || contractorIds.length === 0) {
+        return { statusCode: 400, body: { error: "description and at least one contractorId are required." } };
       }
-      const quoteRequest = await createQuoteRequest(body);
+      // homeownerId comes from the verified session, not the request body.
+      const quoteRequest = await createQuoteRequest({ ...body, homeownerId });
       return { statusCode: 200, body: { quoteRequest } };
     }
 
     if (action === "listForHomeowner") {
-      if (!body.homeownerId) return { statusCode: 400, body: { error: "homeownerId is required." } };
-      const quoteRequests = await listQuoteRequestsForHomeowner(body.homeownerId);
+      if (!homeownerId) return { statusCode: 403, body: { error: "No homeowner profile found for this account." } };
+      const quoteRequests = await listQuoteRequestsForHomeowner(homeownerId);
       return { statusCode: 200, body: { quoteRequests } };
     }
 
     if (action === "listForContractor") {
-      if (!body.contractorId) return { statusCode: 400, body: { error: "contractorId is required." } };
-      const quoteRequests = await listQuoteRequestsForContractor(body.contractorId);
+      if (!contractorId) return { statusCode: 403, body: { error: "No contractor profile found for this account." } };
+      const quoteRequests = await listQuoteRequestsForContractor(contractorId);
       return { statusCode: 200, body: { quoteRequests } };
     }
 
     if (action === "respond") {
-      const { quoteRequestId, contractorId, status, price, message } = body;
-      if (!quoteRequestId || !contractorId || !status) {
-        return { statusCode: 400, body: { error: "quoteRequestId, contractorId, and status are required." } };
+      if (!contractorId) return { statusCode: 403, body: { error: "No contractor profile found for this account." } };
+      const { quoteRequestId, status, price, message } = body;
+      if (!quoteRequestId || !status) {
+        return { statusCode: 400, body: { error: "quoteRequestId and status are required." } };
       }
+      // contractorId comes from the verified session.
       const result = await respondToQuote(quoteRequestId, contractorId, status, price, message);
       return { statusCode: 200, body: result };
     }
 
     if (action === "markJobReported") {
-      const { quoteRequestId, contractorId } = body;
-      if (!quoteRequestId || !contractorId) {
-        return { statusCode: 400, body: { error: "quoteRequestId and contractorId are required." } };
+      if (!contractorId) return { statusCode: 403, body: { error: "No contractor profile found for this account." } };
+      const { quoteRequestId } = body;
+      if (!quoteRequestId) {
+        return { statusCode: 400, body: { error: "quoteRequestId is required." } };
       }
+      // contractorId comes from the verified session.
       const result = await markJobReported(quoteRequestId, contractorId);
       return { statusCode: 200, body: result };
     }
@@ -215,7 +245,7 @@ module.exports = async function handler(req, res) {
     res.status(405).json({ error: "Method not allowed" });
     return;
   }
-  const result = await handleQuotesRequest(req.body);
+  const result = await handleQuotesRequest(req.body, req);
   res.status(result.statusCode).json(result.body);
 };
 
