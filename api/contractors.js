@@ -39,8 +39,19 @@ function toId(value) {
   return Number.isNaN(n) ? value : n;
 }
 
-/** Converts a DB row (snake_case) into the shape the frontend expects (camelCase, with service area as a Set-friendly array). */
-function rowToContractor(row) {
+/**
+ * Converts a DB row (snake_case) into the shape the frontend expects
+ * (camelCase, with service area as a Set-friendly array).
+ *
+ * reviews and thumbsUpCount are optional second/third args -- the directory
+ * listing (listContractors) intentionally does NOT fetch these per-contractor
+ * to keep that query fast and avoid an N+1 query problem across the whole
+ * directory; callers that need real review/thumbs-up data (a contractor's
+ * own profile, the profile modal) fetch from reviews.js separately and merge
+ * it in. When omitted, reviews defaults to [] and thumbsUp defaults to
+ * whatever's on the row (0 if never set) -- existing callers don't break.
+ */
+function rowToContractor(row, reviews, thumbsUpCount) {
   return {
     id: row.id,
     createdAt: row.created_at,
@@ -54,11 +65,11 @@ function rowToContractor(row) {
       zipCodes: row.service_area_zips ? row.service_area_zips.split(",").filter(Boolean) : [],
     },
     status: row.status,
-    thumbsUp: row.thumbs_up || 0,
+    thumbsUp: thumbsUpCount != null ? thumbsUpCount : (row.thumbs_up || 0),
     thumbsDown: row.thumbs_down || 0,
     logoUrl: row.logo_url || null,
     completedJobs: [], // populated separately by the jobs endpoint
-    reviews: [], // reserved for a future reviews table
+    reviews: reviews || [], // populated separately by the reviews endpoint when needed
   };
 }
 
@@ -90,7 +101,7 @@ function contractorToRow(contractor) {
 async function listContractors() {
   const { data, error } = await supabase.from("contractors").select("*").order("created_at", { ascending: false });
   if (error) throw new Error("Could not list contractors: " + error.message);
-  return data.map(rowToContractor);
+  return data.map((row) => rowToContractor(row));
 }
 
 /**
@@ -106,7 +117,7 @@ async function listPendingContractors() {
     .eq("status", "pending")
     .order("created_at", { ascending: false });
   if (error) throw new Error("Could not list pending contractors: " + error.message);
-  return data.map(rowToContractor);
+  return data.map((row) => rowToContractor(row));
 }
 
 /**
@@ -139,6 +150,49 @@ async function updateContractor(contractorId, updates) {
   const { data, error } = await supabase.from("contractors").update(row).eq("id", toId(contractorId)).select().single();
   if (error) throw new Error("Could not update contractor: " + error.message);
   return rowToContractor(data);
+}
+
+/**
+ * Looks up a single contractor by id, with their real reviews and live
+ * thumbs-up count attached -- used for the profile modal and a contractor's
+ * own "viewing as" screen, where seeing accurate review/thumbs-up data
+ * actually matters (unlike the directory list, which intentionally skips
+ * this for speed -- see the comment on rowToContractor).
+ */
+async function getContractorWithReviews(contractorId) {
+  const cId = toId(contractorId);
+
+  const { data: row, error: rowError } = await supabase
+    .from("contractors")
+    .select("*")
+    .eq("id", cId)
+    .single();
+  if (rowError) throw new Error("Could not find contractor: " + rowError.message);
+
+  const { data: reviewRows, error: reviewsError } = await supabase
+    .from("reviews")
+    .select("*")
+    .eq("contractor_id", cId)
+    .order("created_at", { ascending: false });
+  if (reviewsError) throw new Error("Could not load reviews: " + reviewsError.message);
+
+  const { count: thumbsUpCount, error: thumbsError } = await supabase
+    .from("thumbs_up")
+    .select("id", { count: "exact", head: true })
+    .eq("contractor_id", cId);
+  if (thumbsError) throw new Error("Could not count thumbs up: " + thumbsError.message);
+
+  const reviews = (reviewRows || []).map((r) => ({
+    id: r.id,
+    contractorId: r.contractor_id,
+    homeownerId: r.homeowner_id,
+    jobId: r.job_id,
+    rating: r.rating,
+    text: r.text_review || "",
+    createdAt: r.created_at,
+  }));
+
+  return rowToContractor(row, reviews, thumbsUpCount || 0);
 }
 
 /**
@@ -227,6 +281,14 @@ async function handleContractorsRequest(body) {
         return { statusCode: 400, body: { error: "status must be 'approved' or 'rejected'." } };
       }
       const contractor = await updateContractor(body.contractorId, { status: body.status });
+      return { statusCode: 200, body: { contractor } };
+    }
+
+    if (action === "getWithReviews") {
+      if (!body.contractorId) {
+        return { statusCode: 400, body: { error: "contractorId is required." } };
+      }
+      const contractor = await getContractorWithReviews(body.contractorId);
       return { statusCode: 200, body: { contractor } };
     }
 
