@@ -175,7 +175,7 @@ const MAX_PORTFOLIO_PHOTOS = 20;
  * portfolio_photos. Scoped to the current auth user's contractor profile --
  * a contractor can only add photos to their own portfolio.
  */
-async function uploadPortfolioPhoto(authUserId, fileBase64, fileName, contentType, caption) {
+async function uploadPortfolioPhoto(authUserId, fileBase64, fileName, contentType, caption, thumbnailBase64) {
   const { data: contractor, error: lookupError } = await supabase
     .from("contractors")
     .select("id")
@@ -192,8 +192,9 @@ async function uploadPortfolioPhoto(authUserId, fileBase64, fileName, contentTyp
     throw new Error(`Portfolio is full — maximum ${MAX_PORTFOLIO_PHOTOS} photos allowed. Delete some to add more.`);
   }
 
+  const ts = Date.now();
   const buffer = Buffer.from(fileBase64, "base64");
-  const path = `${contractor.id}/${Date.now()}-${fileName}`;
+  const path = `${contractor.id}/${ts}-${fileName}`;
 
   const { error: uploadError } = await supabase.storage
     .from("portfolio-photos")
@@ -202,12 +203,27 @@ async function uploadPortfolioPhoto(authUserId, fileBase64, fileName, contentTyp
 
   const { data: urlData } = supabase.storage.from("portfolio-photos").getPublicUrl(path);
 
+  // Upload thumbnail if provided
+  let thumbnailUrl = null;
+  if (thumbnailBase64) {
+    const thumbBuffer = Buffer.from(thumbnailBase64, "base64");
+    const thumbPath = `${contractor.id}/${ts}-thumb-${fileName}`;
+    const { error: thumbError } = await supabase.storage
+      .from("portfolio-photos")
+      .upload(thumbPath, thumbBuffer, { contentType: "image/jpeg", upsert: false });
+    if (!thumbError) {
+      const { data: thumbUrlData } = supabase.storage.from("portfolio-photos").getPublicUrl(thumbPath);
+      thumbnailUrl = thumbUrlData.publicUrl;
+    }
+  }
+
   const { data, error } = await supabase
     .from("portfolio_photos")
     .insert({
       contractor_id: contractor.id,
       storage_path: path,
       public_url: urlData.publicUrl,
+      thumbnail_url: thumbnailUrl,
       caption: caption || null,
     })
     .select()
@@ -222,6 +238,7 @@ function rowToPhoto(row) {
     id: row.id,
     contractorId: row.contractor_id,
     publicUrl: row.public_url,
+    thumbnailUrl: row.thumbnail_url || row.public_url, // fall back to full if no thumb
     caption: row.caption || null,
     createdAt: row.created_at,
   };
@@ -423,7 +440,8 @@ async function handleContractorsRequest(body, req) {
         body.fileBase64,
         body.fileName,
         body.contentType || "image/jpeg",
-        body.caption || null
+        body.caption || null,
+        body.thumbnailBase64 || null
       );
       return { statusCode: 200, body: { photo } };
     }
@@ -459,6 +477,14 @@ module.exports = async function handler(req, res) {
   }
   const result = await handleContractorsRequest(req.body, req);
   res.status(result.statusCode).json(result.body);
+};
+
+module.exports.config = {
+  api: {
+    bodyParser: {
+      sizeLimit: "4.5mb",
+    },
+  },
 };
 
 module.exports.handleContractorsRequest = handleContractorsRequest;
