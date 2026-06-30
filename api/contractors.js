@@ -18,6 +18,9 @@
  *   POST /api/contractors  { action: "create", contractor: {...} }              <- auth required, creates MY profile
  *   POST /api/contractors  { action: "update", updates: {...} }                 <- auth required, updates MY profile
  *   POST /api/contractors  { action: "uploadLogo", fileBase64, fileName }       <- auth required, for MY profile
+ *   POST /api/contractors  { action: "uploadPortfolioPhoto", fileBase64, fileName, caption? }  <- auth required
+ *   POST /api/contractors  { action: "listPortfolioPhotos", contractorId }      <- public, no auth needed
+ *   POST /api/contractors  { action: "deletePortfolioPhoto", photoId }          <- auth required
  *   POST /api/contractors  { action: "listPending", adminPassword }             <- admin only
  *   POST /api/contractors  { action: "setStatus", adminPassword, contractorId, status }  <- admin only
  *   POST /api/contractors  { action: "getWithReviews", contractorId }           <- public, no auth needed
@@ -165,6 +168,109 @@ async function setContractorStatus(contractorId, status) {
   return rowToContractor(data);
 }
 
+const MAX_PORTFOLIO_PHOTOS = 20;
+
+/**
+ * Uploads a portfolio photo to Supabase Storage and creates a row in
+ * portfolio_photos. Scoped to the current auth user's contractor profile --
+ * a contractor can only add photos to their own portfolio.
+ */
+async function uploadPortfolioPhoto(authUserId, fileBase64, fileName, contentType, caption) {
+  const { data: contractor, error: lookupError } = await supabase
+    .from("contractors")
+    .select("id")
+    .eq("auth_user_id", authUserId)
+    .single();
+  if (lookupError || !contractor) throw new Error("You don't have a contractor profile yet.");
+
+  const { count, error: countError } = await supabase
+    .from("portfolio_photos")
+    .select("id", { count: "exact", head: true })
+    .eq("contractor_id", contractor.id);
+  if (countError) throw new Error("Could not check photo count: " + countError.message);
+  if (count >= MAX_PORTFOLIO_PHOTOS) {
+    throw new Error(`Portfolio is full — maximum ${MAX_PORTFOLIO_PHOTOS} photos allowed. Delete some to add more.`);
+  }
+
+  const buffer = Buffer.from(fileBase64, "base64");
+  const path = `${contractor.id}/${Date.now()}-${fileName}`;
+
+  const { error: uploadError } = await supabase.storage
+    .from("portfolio-photos")
+    .upload(path, buffer, { contentType, upsert: false });
+  if (uploadError) throw new Error("Could not upload photo: " + uploadError.message);
+
+  const { data: urlData } = supabase.storage.from("portfolio-photos").getPublicUrl(path);
+
+  const { data, error } = await supabase
+    .from("portfolio_photos")
+    .insert({
+      contractor_id: contractor.id,
+      storage_path: path,
+      public_url: urlData.publicUrl,
+      caption: caption || null,
+    })
+    .select()
+    .single();
+  if (error) throw new Error("Could not save photo record: " + error.message);
+
+  return rowToPhoto(data);
+}
+
+function rowToPhoto(row) {
+  return {
+    id: row.id,
+    contractorId: row.contractor_id,
+    publicUrl: row.public_url,
+    caption: row.caption || null,
+    createdAt: row.created_at,
+  };
+}
+
+async function listPortfolioPhotos(contractorId) {
+  const { data, error } = await supabase
+    .from("portfolio_photos")
+    .select("*")
+    .eq("contractor_id", toId(contractorId))
+    .order("created_at", { ascending: false });
+  if (error) throw new Error("Could not list portfolio photos: " + error.message);
+  return data.map(rowToPhoto);
+}
+
+/**
+ * Deletes a portfolio photo -- verifies the photo belongs to the current
+ * auth user's contractor profile before deleting anything.
+ */
+async function deletePortfolioPhoto(authUserId, photoId) {
+  const { data: contractor, error: lookupError } = await supabase
+    .from("contractors")
+    .select("id")
+    .eq("auth_user_id", authUserId)
+    .single();
+  if (lookupError || !contractor) throw new Error("Contractor profile not found.");
+
+  const { data: photo, error: photoError } = await supabase
+    .from("portfolio_photos")
+    .select("id, contractor_id, storage_path")
+    .eq("id", toId(photoId))
+    .maybeSingle();
+  if (photoError) throw new Error("Could not find photo: " + photoError.message);
+  if (!photo) throw new Error("Photo not found.");
+  if (photo.contractor_id !== contractor.id) throw new Error("You can only delete your own photos.");
+
+  await supabase.storage.from("portfolio-photos").remove([photo.storage_path]);
+
+  const { error: deleteError } = await supabase
+    .from("portfolio_photos")
+    .delete()
+    .eq("id", toId(photoId));
+  if (deleteError) throw new Error("Could not delete photo record: " + deleteError.message);
+
+  return { deleted: true, photoId };
+}
+
+
+
 async function getContractorWithReviews(contractorId) {
   const cId = toId(contractorId);
 
@@ -242,6 +348,14 @@ async function handleContractorsRequest(body, req) {
       return { statusCode: 200, body: { contractor } };
     }
 
+    if (action === "listPortfolioPhotos") {
+      if (!body.contractorId) {
+        return { statusCode: 400, body: { error: "contractorId is required." } };
+      }
+      const photos = await listPortfolioPhotos(body.contractorId);
+      return { statusCode: 200, body: { photos } };
+    }
+
     if (action === "listPending") {
       if (!checkAdminPassword(body.adminPassword)) {
         return { statusCode: 401, body: { error: "Incorrect admin password." } };
@@ -298,6 +412,28 @@ async function handleContractorsRequest(body, req) {
         body.contentType || "image/png"
       );
       return { statusCode: 200, body: { contractor } };
+    }
+
+    if (action === "uploadPortfolioPhoto") {
+      if (!body.fileBase64 || !body.fileName) {
+        return { statusCode: 400, body: { error: "fileBase64 and fileName are required." } };
+      }
+      const photo = await uploadPortfolioPhoto(
+        authUser.id,
+        body.fileBase64,
+        body.fileName,
+        body.contentType || "image/jpeg",
+        body.caption || null
+      );
+      return { statusCode: 200, body: { photo } };
+    }
+
+    if (action === "deletePortfolioPhoto") {
+      if (!body.photoId) {
+        return { statusCode: 400, body: { error: "photoId is required." } };
+      }
+      const result = await deletePortfolioPhoto(authUser.id, body.photoId);
+      return { statusCode: 200, body: result };
     }
 
     return { statusCode: 400, body: { error: `Unknown action: ${action}` } };
