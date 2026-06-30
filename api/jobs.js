@@ -34,11 +34,13 @@ const { createClient } = require("@supabase/supabase-js");
 
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SECRET_KEY);
 
-/**
- * See the matching comment in quotes.js -- every id column here is int8,
- * not uuid, so ids must be converted to numbers before being used in a
- * query. IDs arrive as strings from the frontend over JSON.
- */
+function checkAdminPassword(password) {
+  const realPassword = process.env.ADMIN_PASSWORD;
+  if (!realPassword) return false;
+  return password === realPassword;
+}
+
+
 function toId(value) {
   if (value === null || value === undefined || value === "") return value;
   const n = Number(value);
@@ -352,65 +354,137 @@ async function setAdminReviewStatus(contractorId, status) {
   return { contractorId: data.id, adminReviewStatus: data.admin_review_status };
 }
 
-async function handleJobsRequest(body) {
+/**
+ * Verifies the Authorization header against Supabase Auth.
+ * Returns { id, email } for the authenticated user, or null if no valid session.
+ */
+async function getAuthedUser(req) {
+  const authHeader = req.headers["authorization"] || req.headers["Authorization"];
+  if (!authHeader || !authHeader.startsWith("Bearer ")) return null;
+  const token = authHeader.slice("Bearer ".length);
+  const { data, error } = await supabase.auth.getUser(token);
+  if (error || !data?.user) return null;
+  return { id: data.user.id, email: data.user.email };
+}
+
+/**
+ * Given a verified Supabase auth user id, returns the matching homeowner
+ * and contractor profile ids (if they exist). Used to scope job actions to
+ * "my own jobs" without trusting any id the client sends in the body.
+ */
+async function getProfileIds(authUserId) {
+  const [homeownerRes, contractorRes] = await Promise.allSettled([
+    supabase.from("homeowners").select("id").eq("auth_user_id", authUserId).maybeSingle(),
+    supabase.from("contractors").select("id").eq("auth_user_id", authUserId).maybeSingle(),
+  ]);
+  return {
+    homeownerId: homeownerRes.status === "fulfilled" ? homeownerRes.value?.data?.id ?? null : null,
+    contractorId: contractorRes.status === "fulfilled" ? contractorRes.value?.data?.id ?? null : null,
+  };
+}
+
+async function handleJobsRequest(body, req) {
   const { action } = body || {};
 
   try {
-    if (action === "report") {
-      const { contractorId, description, reportedAmount } = body;
-      if (!contractorId || !description || !reportedAmount) {
-        return { statusCode: 400, body: { error: "contractorId, description, and reportedAmount are required." } };
-      }
-      const job = await reportJob(body);
-      return { statusCode: 200, body: { job } };
-    }
-
-    if (action === "listForContractor") {
-      if (!body.contractorId) return { statusCode: 400, body: { error: "contractorId is required." } };
-      const jobs = await listJobsForContractor(body.contractorId);
-      return { statusCode: 200, body: { jobs } };
-    }
-
-    if (action === "listForHomeowner") {
-      if (!body.homeownerId) return { statusCode: 400, body: { error: "homeownerId is required." } };
-      const jobs = await listJobsForHomeowner(body.homeownerId);
-      return { statusCode: 200, body: { jobs } };
-    }
-
-    if (action === "confirm") {
-      if (!body.jobId) return { statusCode: 400, body: { error: "jobId is required." } };
-      const job = await confirmJob(body.jobId);
-      return { statusCode: 200, body: { job } };
-    }
-
-    if (action === "dispute") {
-      if (!body.jobId) return { statusCode: 400, body: { error: "jobId is required." } };
-      const job = await disputeJob(body.jobId, body.note);
-      return { statusCode: 200, body: { job } };
-    }
-
+    // Admin-only actions -- gated by ADMIN_PASSWORD, no session needed.
     if (action === "listLowReportContractors") {
+      if (!checkAdminPassword(body.adminPassword)) {
+        return { statusCode: 401, body: { error: "Incorrect admin password." } };
+      }
       const flagged = await listLowReportContractors();
       return { statusCode: 200, body: { flagged } };
     }
 
     if (action === "setAdminReviewStatus") {
+      if (!checkAdminPassword(body.adminPassword)) {
+        return { statusCode: 401, body: { error: "Incorrect admin password." } };
+      }
       if (!body.contractorId) return { statusCode: 400, body: { error: "contractorId is required." } };
       const result = await setAdminReviewStatus(body.contractorId, body.status ?? null);
       return { statusCode: 200, body: result };
     }
 
-    if (action === "editReportedAmount") {
-      if (!body.jobId || body.newAmount == null) {
-        return { statusCode: 400, body: { error: "jobId and newAmount are required." } };
+    if (action === "listDisputedJobs") {
+      if (!checkAdminPassword(body.adminPassword)) {
+        return { statusCode: 401, body: { error: "Incorrect admin password." } };
       }
-      const job = await editReportedAmount(body.jobId, body.newAmount, body.lowReportReason);
+      const disputed = await listDisputedJobs();
+      return { statusCode: 200, body: { disputed } };
+    }
+
+    // All other actions require a verified session.
+    const authUser = await getAuthedUser(req);
+    if (!authUser) {
+      return { statusCode: 401, body: { error: "You must be signed in." } };
+    }
+
+    const { homeownerId, contractorId } = await getProfileIds(authUser.id);
+
+    if (action === "report") {
+      if (!contractorId) return { statusCode: 403, body: { error: "No contractor profile found for this account." } };
+      const { quoteRequestId, description, reportedAmount, lowReportReason } = body;
+      if (!description || !reportedAmount) {
+        return { statusCode: 400, body: { error: "description and reportedAmount are required." } };
+      }
+      // contractorId comes from the verified session, not the request body.
+      const job = await reportJob({ contractorId, quoteRequestId, homeownerId: body.homeownerId, description, reportedAmount, lowReportReason });
       return { statusCode: 200, body: { job } };
     }
 
-    if (action === "listDisputedJobs") {
-      const disputed = await listDisputedJobs();
-      return { statusCode: 200, body: { disputed } };
+    if (action === "listForContractor") {
+      if (!contractorId) return { statusCode: 403, body: { error: "No contractor profile found for this account." } };
+      const jobs = await listJobsForContractor(contractorId);
+      return { statusCode: 200, body: { jobs } };
+    }
+
+    if (action === "listForHomeowner") {
+      if (!homeownerId) return { statusCode: 403, body: { error: "No homeowner profile found for this account." } };
+      const jobs = await listJobsForHomeowner(homeownerId);
+      return { statusCode: 200, body: { jobs } };
+    }
+
+    if (action === "confirm") {
+      if (!homeownerId) return { statusCode: 403, body: { error: "No homeowner profile found for this account." } };
+      if (!body.jobId) return { statusCode: 400, body: { error: "jobId is required." } };
+      // Verify this job actually belongs to this homeowner before confirming.
+      const { data: job, error: jobError } = await supabase
+        .from("completed_jobs").select("homeowner_id").eq("id", toId(body.jobId)).maybeSingle();
+      if (jobError || !job) return { statusCode: 404, body: { error: "Job not found." } };
+      if (String(job.homeowner_id) !== String(homeownerId)) {
+        return { statusCode: 403, body: { error: "This job doesn't belong to your account." } };
+      }
+      const confirmed = await confirmJob(body.jobId);
+      return { statusCode: 200, body: { job: confirmed } };
+    }
+
+    if (action === "dispute") {
+      if (!homeownerId) return { statusCode: 403, body: { error: "No homeowner profile found for this account." } };
+      if (!body.jobId) return { statusCode: 400, body: { error: "jobId is required." } };
+      const { data: job, error: jobError } = await supabase
+        .from("completed_jobs").select("homeowner_id").eq("id", toId(body.jobId)).maybeSingle();
+      if (jobError || !job) return { statusCode: 404, body: { error: "Job not found." } };
+      if (String(job.homeowner_id) !== String(homeownerId)) {
+        return { statusCode: 403, body: { error: "This job doesn't belong to your account." } };
+      }
+      const disputed = await disputeJob(body.jobId, body.note);
+      return { statusCode: 200, body: { job: disputed } };
+    }
+
+    if (action === "editReportedAmount") {
+      if (!contractorId) return { statusCode: 403, body: { error: "No contractor profile found for this account." } };
+      if (!body.jobId || body.newAmount == null) {
+        return { statusCode: 400, body: { error: "jobId and newAmount are required." } };
+      }
+      // Verify this job belongs to this contractor.
+      const { data: job, error: jobError } = await supabase
+        .from("completed_jobs").select("contractor_id").eq("id", toId(body.jobId)).maybeSingle();
+      if (jobError || !job) return { statusCode: 404, body: { error: "Job not found." } };
+      if (String(job.contractor_id) !== String(contractorId)) {
+        return { statusCode: 403, body: { error: "This job doesn't belong to your account." } };
+      }
+      const edited = await editReportedAmount(body.jobId, body.newAmount, body.lowReportReason);
+      return { statusCode: 200, body: { job: edited } };
     }
 
     return { statusCode: 400, body: { error: `Unknown action: ${action}` } };
@@ -434,7 +508,7 @@ module.exports = async function handler(req, res) {
     res.status(405).json({ error: "Method not allowed" });
     return;
   }
-  const result = await handleJobsRequest(req.body);
+  const result = await handleJobsRequest(req.body, req);
   res.status(result.statusCode).json(result.body);
 };
 
