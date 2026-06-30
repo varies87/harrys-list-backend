@@ -8,7 +8,7 @@
  *   POST /api/reviews  { action: "create", contractorId, homeownerId, jobId, rating, text }
  *   POST /api/reviews  { action: "listForContractor", contractorId }
  *   POST /api/reviews  { action: "toggleThumbsUp", contractorId, homeownerId }
- *   POST /api/reviews  { action: "getThumbsUpSummary", contractorId, homeownerId? }
+ *   POST /api/reviews  { action: "getThumbsUpStatus", contractorId, homeownerId }
  *
  * ENVIRONMENT VARIABLES
  *   SUPABASE_URL
@@ -102,6 +102,14 @@ async function listReviewsForContractor(contractorId) {
  * account, even for work done off-platform, since there's no rating
  * attached that could be used to sabotage a contractor (only positive
  * signal, never negative).
+ *
+ * Also keeps contractors.thumbs_up_count in sync -- that denormalized
+ * counter is what the directory list actually reads (see rowToContractor
+ * in contractors.js), so every contractor card can show a live count
+ * without an extra per-card API call. The thumbs_up table remains the
+ * source of truth for "who has thumbs-upped this contractor" and enforces
+ * one-per-homeowner via its unique constraint; this counter is just a
+ * fast-read cache of its count.
  */
 async function toggleThumbsUp(contractorId, homeownerId) {
   const cId = toId(contractorId);
@@ -118,41 +126,65 @@ async function toggleThumbsUp(contractorId, homeownerId) {
   if (existing) {
     const { error: deleteError } = await supabase.from("thumbs_up").delete().eq("id", existing.id);
     if (deleteError) throw new Error("Could not remove thumbs up: " + deleteError.message);
+    await decrementThumbsUpCount(cId);
     return { thumbsUp: false };
   }
 
   const { error: insertError } = await supabase.from("thumbs_up").insert({ contractor_id: cId, homeowner_id: hId });
   if (insertError) throw new Error("Could not add thumbs up: " + insertError.message);
+  await incrementThumbsUpCount(cId);
   return { thumbsUp: true };
 }
 
 /**
- * Returns the total thumbs up count for a contractor, plus -- if a
- * homeownerId is provided -- whether THAT homeowner has already thumbs-upped
- * them (so the frontend can render the button as already-active).
+ * Small helpers that bump the denormalized counter. Read-then-write rather
+ * than a single atomic SQL increment, since the Supabase JS client doesn't
+ * expose raw SQL expressions for updates -- acceptable here because thumbs
+ * up isn't a high-contention path (one click per homeowner per contractor,
+ * not a hot counter being hit many times per second).
  */
-async function getThumbsUpSummary(contractorId, homeownerId) {
-  const cId = toId(contractorId);
+async function incrementThumbsUpCount(contractorId) {
+  const { data, error: readError } = await supabase
+    .from("contractors")
+    .select("thumbs_up_count")
+    .eq("id", contractorId)
+    .single();
+  if (readError) throw new Error("Could not read thumbs up count: " + readError.message);
+  const { error: writeError } = await supabase
+    .from("contractors")
+    .update({ thumbs_up_count: (data.thumbs_up_count || 0) + 1 })
+    .eq("id", contractorId);
+  if (writeError) throw new Error("Could not update thumbs up count: " + writeError.message);
+}
 
-  const { count, error: countError } = await supabase
+async function decrementThumbsUpCount(contractorId) {
+  const { data, error: readError } = await supabase
+    .from("contractors")
+    .select("thumbs_up_count")
+    .eq("id", contractorId)
+    .single();
+  if (readError) throw new Error("Could not read thumbs up count: " + readError.message);
+  const next = Math.max(0, (data.thumbs_up_count || 0) - 1);
+  const { error: writeError } = await supabase.from("contractors").update({ thumbs_up_count: next }).eq("id", contractorId);
+  if (writeError) throw new Error("Could not update thumbs up count: " + writeError.message);
+}
+
+/**
+ * Returns whether a given homeowner has already thumbs-upped a contractor --
+ * used to render the thumbs-up button as already-active. The COUNT itself
+ * is no longer fetched here; it lives on contractors.thumbs_up_count and
+ * comes back for free with the normal contractor list/profile fetch.
+ */
+async function getThumbsUpStatus(contractorId, homeownerId) {
+  if (!homeownerId) return { alreadyThumbsUpped: false };
+  const { data, error } = await supabase
     .from("thumbs_up")
-    .select("id", { count: "exact", head: true })
-    .eq("contractor_id", cId);
-  if (countError) throw new Error("Could not count thumbs up: " + countError.message);
-
-  let alreadyThumbsUpped = false;
-  if (homeownerId) {
-    const { data, error } = await supabase
-      .from("thumbs_up")
-      .select("id")
-      .eq("contractor_id", cId)
-      .eq("homeowner_id", toId(homeownerId))
-      .maybeSingle();
-    if (error) throw new Error("Could not check thumbs up status: " + error.message);
-    alreadyThumbsUpped = !!data;
-  }
-
-  return { count: count || 0, alreadyThumbsUpped };
+    .select("id")
+    .eq("contractor_id", toId(contractorId))
+    .eq("homeowner_id", toId(homeownerId))
+    .maybeSingle();
+  if (error) throw new Error("Could not check thumbs up status: " + error.message);
+  return { alreadyThumbsUpped: !!data };
 }
 
 async function handleReviewsRequest(body) {
@@ -185,10 +217,12 @@ async function handleReviewsRequest(body) {
       return { statusCode: 200, body: result };
     }
 
-    if (action === "getThumbsUpSummary") {
-      if (!body.contractorId) return { statusCode: 400, body: { error: "contractorId is required." } };
-      const summary = await getThumbsUpSummary(body.contractorId, body.homeownerId);
-      return { statusCode: 200, body: summary };
+    if (action === "getThumbsUpStatus") {
+      if (!body.contractorId || !body.homeownerId) {
+        return { statusCode: 400, body: { error: "contractorId and homeownerId are required." } };
+      }
+      const status = await getThumbsUpStatus(body.contractorId, body.homeownerId);
+      return { statusCode: 200, body: status };
     }
 
     return { statusCode: 400, body: { error: `Unknown action: ${action}` } };
