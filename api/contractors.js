@@ -43,15 +43,21 @@ function toId(value) {
  * Converts a DB row (snake_case) into the shape the frontend expects
  * (camelCase, with service area as a Set-friendly array).
  *
- * reviews and thumbsUpCount are optional second/third args -- the directory
- * listing (listContractors) intentionally does NOT fetch these per-contractor
- * to keep that query fast and avoid an N+1 query problem across the whole
- * directory; callers that need real review/thumbs-up data (a contractor's
- * own profile, the profile modal) fetch from reviews.js separately and merge
- * it in. When omitted, reviews defaults to [] and thumbsUp defaults to
- * whatever's on the row (0 if never set) -- existing callers don't break.
+ * thumbsUp comes directly from contractors.thumbs_up_count -- a
+ * denormalized counter kept in sync by reviews.js's toggleThumbsUp, so
+ * every contractor in the directory list gets an accurate, live thumbs-up
+ * count with zero extra queries. (Whether the CURRENT homeowner specifically
+ * has thumbs-upped a given contractor is a separate, on-demand check --
+ * see reviews.js's getThumbsUpStatus -- only needed when viewing one
+ * contractor's profile, not for every card in the grid.)
+ *
+ * reviews is an optional second arg -- the directory listing (listContractors)
+ * intentionally does NOT fetch full review text/ratings per-contractor to
+ * keep that query fast; callers that need real review data (a contractor's
+ * own profile, the profile modal) fetch it from reviews.js or
+ * getContractorWithReviews below and merge it in. Defaults to [].
  */
-function rowToContractor(row, reviews, thumbsUpCount) {
+function rowToContractor(row, reviews) {
   return {
     id: row.id,
     createdAt: row.created_at,
@@ -65,7 +71,7 @@ function rowToContractor(row, reviews, thumbsUpCount) {
       zipCodes: row.service_area_zips ? row.service_area_zips.split(",").filter(Boolean) : [],
     },
     status: row.status,
-    thumbsUp: thumbsUpCount != null ? thumbsUpCount : (row.thumbs_up || 0),
+    thumbsUp: row.thumbs_up_count || 0,
     thumbsDown: row.thumbs_down || 0,
     logoUrl: row.logo_url || null,
     completedJobs: [], // populated separately by the jobs endpoint
@@ -153,11 +159,12 @@ async function updateContractor(contractorId, updates) {
 }
 
 /**
- * Looks up a single contractor by id, with their real reviews and live
- * thumbs-up count attached -- used for the profile modal and a contractor's
- * own "viewing as" screen, where seeing accurate review/thumbs-up data
- * actually matters (unlike the directory list, which intentionally skips
- * this for speed -- see the comment on rowToContractor).
+ * Looks up a single contractor by id, with their real reviews attached --
+ * used for the profile modal and a contractor's own "viewing as" screen,
+ * where seeing actual review text/ratings matters (unlike the directory
+ * list, which intentionally skips fetching full reviews for speed -- see
+ * the comment on rowToContractor). Thumbs-up count comes along for free
+ * since it's a column on the contractors row itself.
  */
 async function getContractorWithReviews(contractorId) {
   const cId = toId(contractorId);
@@ -176,12 +183,6 @@ async function getContractorWithReviews(contractorId) {
     .order("created_at", { ascending: false });
   if (reviewsError) throw new Error("Could not load reviews: " + reviewsError.message);
 
-  const { count: thumbsUpCount, error: thumbsError } = await supabase
-    .from("thumbs_up")
-    .select("id", { count: "exact", head: true })
-    .eq("contractor_id", cId);
-  if (thumbsError) throw new Error("Could not count thumbs up: " + thumbsError.message);
-
   const reviews = (reviewRows || []).map((r) => ({
     id: r.id,
     contractorId: r.contractor_id,
@@ -192,7 +193,7 @@ async function getContractorWithReviews(contractorId) {
     createdAt: r.created_at,
   }));
 
-  return rowToContractor(row, reviews, thumbsUpCount || 0);
+  return rowToContractor(row, reviews);
 }
 
 /**
