@@ -1,14 +1,20 @@
 /**
  * api/homeowners.js
  * ---------------------------------------------------------------------------
- * Backend endpoint for homeowner accounts: signing in (by matching email to
- * an existing row) or signing up (creating a new one), updating profile
- * fields, and toggling favorite contractors.
+ * Backend endpoint for homeowner accounts. Real auth: homeowners sign up
+ * and sign in directly against Supabase Auth from the frontend (using the
+ * public anon key -- see shared.js), which issues a session token. That
+ * token is sent on every request as an Authorization header, and THIS file
+ * verifies it server-side before trusting "who" is making the request.
+ *
+ * This replaces the old approach where the frontend simply sent a
+ * homeownerId in the request body and the backend trusted it blindly.
  *
  * Routes (distinguished by `action` in the request body):
- *   POST /api/homeowners  { action: "authenticate", name, email, zip }
- *   POST /api/homeowners  { action: "update", homeownerId, updates: {...} }
- *   POST /api/homeowners  { action: "toggleFavorite", homeownerId, contractorId }
+ *   POST /api/homeowners  { action: "afterSignUp", name, zip }
+ *   POST /api/homeowners  { action: "getCurrent" }
+ *   POST /api/homeowners  { action: "update", updates: {...} }
+ *   POST /api/homeowners  { action: "toggleFavorite", contractorId }
  *
  * ENVIRONMENT VARIABLES
  *   SUPABASE_URL
@@ -19,16 +25,6 @@
 const { createClient } = require("@supabase/supabase-js");
 
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SECRET_KEY);
-
-/**
- * See the matching comment in quotes.js -- ids are int8 (numbers) in the
- * database, but always arrive as strings from the frontend over JSON.
- */
-function toId(value) {
-  if (value === null || value === undefined || value === "") return value;
-  const n = Number(value);
-  return Number.isNaN(n) ? value : n;
-}
 
 function rowToHomeowner(row) {
   return {
@@ -43,64 +39,76 @@ function rowToHomeowner(row) {
 }
 
 /**
- * Signs in to an existing homeowner account if the email matches one already
- * in the database, otherwise creates a new one. This mirrors the original
- * in-memory behavior from the prototype: email is the unique identifier,
- * there's no password in this version.
+ * Verifies the Authorization header against Supabase Auth and returns the
+ * authenticated user's id (a uuid) and email -- or null if there's no
+ * valid session. supabase.auth.getUser() cryptographically verifies the
+ * token was genuinely issued by Supabase Auth for this project. A forged
+ * or expired token fails here.
  */
-async function authenticateHomeowner(name, email, zip) {
-  const normalizedEmail = email.trim().toLowerCase();
+async function getAuthedUser(req) {
+  const authHeader = req.headers["authorization"] || req.headers["Authorization"];
+  if (!authHeader || !authHeader.startsWith("Bearer ")) return null;
+  const token = authHeader.slice("Bearer ".length);
 
-  const { data: existing, error: lookupError } = await supabase
+  const { data, error } = await supabase.auth.getUser(token);
+  if (error || !data?.user) return null;
+  return { id: data.user.id, email: data.user.email };
+}
+
+async function findHomeownerByAuthId(authUserId) {
+  const { data, error } = await supabase
     .from("homeowners")
     .select("*")
-    .ilike("email", normalizedEmail)
+    .eq("auth_user_id", authUserId)
     .maybeSingle();
+  if (error) throw new Error("Could not look up homeowner: " + error.message);
+  return data ? rowToHomeowner(data) : null;
+}
 
-  if (lookupError) throw new Error("Could not look up homeowner: " + lookupError.message);
-
-  if (existing) {
-    return rowToHomeowner(existing);
-  }
-
-  const { data: created, error: createError } = await supabase
+async function createHomeownerForAuthUser(authUser, name, zip) {
+  const { data, error } = await supabase
     .from("homeowners")
     .insert({
+      auth_user_id: authUser.id,
       name: name.trim(),
-      email: email.trim(),
+      email: authUser.email,
       zip: zip.trim(),
       favorite_contractor_ids: "",
     })
     .select()
     .single();
-
-  if (createError) throw new Error("Could not create homeowner: " + createError.message);
-  return rowToHomeowner(created);
+  if (error) {
+    if (error.code === "23505") {
+      throw new Error("An account already exists for this email.");
+    }
+    throw new Error("Could not create homeowner profile: " + error.message);
+  }
+  return rowToHomeowner(data);
 }
 
-async function updateHomeowner(homeownerId, updates) {
+async function updateHomeowner(authUserId, updates) {
   const row = {};
   if (updates.name !== undefined) row.name = updates.name;
   if (updates.zip !== undefined) row.zip = updates.zip;
 
-  const { data, error } = await supabase.from("homeowners").update(row).eq("id", toId(homeownerId)).select().single();
+  const { data, error } = await supabase
+    .from("homeowners")
+    .update(row)
+    .eq("auth_user_id", authUserId)
+    .select()
+    .single();
   if (error) throw new Error("Could not update homeowner: " + error.message);
   return rowToHomeowner(data);
 }
 
-async function toggleFavorite(homeownerId, contractorId) {
+async function toggleFavorite(authUserId, contractorId) {
   const { data: current, error: fetchError } = await supabase
     .from("homeowners")
     .select("favorite_contractor_ids")
-    .eq("id", toId(homeownerId))
+    .eq("auth_user_id", authUserId)
     .single();
   if (fetchError) throw new Error("Could not find homeowner: " + fetchError.message);
 
-  // favorite_contractor_ids is stored as a comma-separated string of
-  // contractor ids. Compare everything as strings here (not toId) since
-  // we're matching against text split out of a text column, not querying
-  // the database directly -- the goal is just consistent comparison, and
-  // String() on both sides is simpler than converting back and forth.
   const currentIds = current.favorite_contractor_ids
     ? current.favorite_contractor_ids.split(",").filter(Boolean)
     : [];
@@ -111,38 +119,49 @@ async function toggleFavorite(homeownerId, contractorId) {
   const { data, error } = await supabase
     .from("homeowners")
     .update({ favorite_contractor_ids: nextIds.join(",") })
-    .eq("id", toId(homeownerId))
+    .eq("auth_user_id", authUserId)
     .select()
     .single();
   if (error) throw new Error("Could not update favorites: " + error.message);
   return rowToHomeowner(data);
 }
 
-async function handleHomeownersRequest(body) {
+async function handleHomeownersRequest(body, req) {
   const { action } = body || {};
 
   try {
-    if (action === "authenticate") {
-      if (!body.name || !body.email || !body.zip) {
-        return { statusCode: 400, body: { error: "name, email, and zip are required." } };
+    const authUser = await getAuthedUser(req);
+    if (!authUser) {
+      return { statusCode: 401, body: { error: "You must be signed in." } };
+    }
+
+    if (action === "afterSignUp") {
+      if (!body.name || !body.zip) {
+        return { statusCode: 400, body: { error: "name and zip are required." } };
       }
-      const homeowner = await authenticateHomeowner(body.name, body.email, body.zip);
+      const existing = await findHomeownerByAuthId(authUser.id);
+      if (existing) {
+        return { statusCode: 200, body: { homeowner: existing } };
+      }
+      const homeowner = await createHomeownerForAuthUser(authUser, body.name, body.zip);
+      return { statusCode: 200, body: { homeowner } };
+    }
+
+    if (action === "getCurrent") {
+      const homeowner = await findHomeownerByAuthId(authUser.id);
       return { statusCode: 200, body: { homeowner } };
     }
 
     if (action === "update") {
-      if (!body.homeownerId) {
-        return { statusCode: 400, body: { error: "homeownerId is required." } };
-      }
-      const homeowner = await updateHomeowner(body.homeownerId, body.updates || {});
+      const homeowner = await updateHomeowner(authUser.id, body.updates || {});
       return { statusCode: 200, body: { homeowner } };
     }
 
     if (action === "toggleFavorite") {
-      if (!body.homeownerId || !body.contractorId) {
-        return { statusCode: 400, body: { error: "homeownerId and contractorId are required." } };
+      if (!body.contractorId) {
+        return { statusCode: 400, body: { error: "contractorId is required." } };
       }
-      const homeowner = await toggleFavorite(body.homeownerId, body.contractorId);
+      const homeowner = await toggleFavorite(authUser.id, body.contractorId);
       return { statusCode: 200, body: { homeowner } };
     }
 
@@ -156,7 +175,7 @@ async function handleHomeownersRequest(body) {
 module.exports = async function handler(req, res) {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
 
   if (req.method === "OPTIONS") {
     res.status(200).end();
@@ -167,7 +186,7 @@ module.exports = async function handler(req, res) {
     res.status(405).json({ error: "Method not allowed" });
     return;
   }
-  const result = await handleHomeownersRequest(req.body);
+  const result = await handleHomeownersRequest(req.body, req);
   res.status(result.statusCode).json(result.body);
 };
 
