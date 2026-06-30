@@ -170,42 +170,41 @@ async function disputeJob(jobId, note) {
  * count, and the individual low-report jobs so the admin can read the reasons.
  */
 async function listLowReportContractors() {
-  // Pull all low-report jobs with contractor info joined.
   const { data: jobs, error: jobsError } = await supabase
     .from("completed_jobs")
-    .select(`
-      id,
-      contractor_id,
-      description,
-      quoted_amount,
-      reported_amount,
-      low_report_reason,
-      created_at,
-      contractors (
-        id,
-        name,
-        trade,
-        email,
-        admin_review_status
-      )
-    `)
+    .select("id, contractor_id, description, quoted_amount, reported_amount, low_report_reason, created_at")
     .eq("is_low_report", true)
     .order("created_at", { ascending: false });
 
   if (jobsError) throw new Error("Could not fetch low-report jobs: " + jobsError.message);
+  if (!jobs || jobs.length === 0) return [];
+
+  // Fetch contractor details separately -- avoids relying on a FK
+  // relationship in Supabase's schema cache between completed_jobs and
+  // contractors, which may not exist if the tables were created without
+  // an explicit foreign key constraint.
+  const contractorIds = [...new Set(jobs.map((j) => j.contractor_id))];
+  const { data: contractors, error: contractorsError } = await supabase
+    .from("contractors")
+    .select("id, business_name, trade, email, admin_review_status")
+    .in("id", contractorIds);
+  if (contractorsError) throw new Error("Could not fetch contractors for low-report jobs: " + contractorsError.message);
+
+  const contractorById = new Map((contractors || []).map((c) => [c.id, c]));
 
   // Group by contractor and only surface those with 3+ low reports.
   const byContractor = {};
   for (const job of jobs) {
     const cId = job.contractor_id;
+    const c = contractorById.get(cId);
     if (!byContractor[cId]) {
       byContractor[cId] = {
         contractor: {
           id: cId,
-          name: job.contractors?.name,
-          trade: job.contractors?.trade,
-          email: job.contractors?.email,
-          adminReviewStatus: job.contractors?.admin_review_status || null,
+          name: c?.business_name,
+          trade: c?.trade,
+          email: c?.email,
+          adminReviewStatus: c?.admin_review_status || null,
         },
         lowReportCount: 0,
         jobs: [],
