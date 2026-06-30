@@ -187,34 +187,24 @@ async function getThumbsUpStatus(contractorId, homeownerId) {
   return { alreadyThumbsUpped: !!data };
 }
 
-async function handleReviewsRequest(body) {
+async function getAuthedUser(req) {
+  const authHeader = req.headers["authorization"] || req.headers["Authorization"];
+  if (!authHeader || !authHeader.startsWith("Bearer ")) return null;
+  const token = authHeader.slice("Bearer ".length);
+  const { data, error } = await supabase.auth.getUser(token);
+  if (error || !data?.user) return null;
+  return { id: data.user.id, email: data.user.email };
+}
+
+async function handleReviewsRequest(body, req) {
   const { action } = body || {};
 
   try {
-    if (action === "create") {
-      const { contractorId, homeownerId, jobId, rating } = body;
-      if (!contractorId || !homeownerId || !jobId || !rating) {
-        return { statusCode: 400, body: { error: "contractorId, homeownerId, jobId, and rating are required." } };
-      }
-      if (rating < 1 || rating > 5) {
-        return { statusCode: 400, body: { error: "rating must be between 1 and 5." } };
-      }
-      const review = await createReview(body);
-      return { statusCode: 200, body: { review } };
-    }
-
+    // Public read -- no auth required.
     if (action === "listForContractor") {
       if (!body.contractorId) return { statusCode: 400, body: { error: "contractorId is required." } };
       const reviews = await listReviewsForContractor(body.contractorId);
       return { statusCode: 200, body: { reviews } };
-    }
-
-    if (action === "toggleThumbsUp") {
-      if (!body.contractorId || !body.homeownerId) {
-        return { statusCode: 400, body: { error: "contractorId and homeownerId are required." } };
-      }
-      const result = await toggleThumbsUp(body.contractorId, body.homeownerId);
-      return { statusCode: 200, body: result };
     }
 
     if (action === "getThumbsUpStatus") {
@@ -223,6 +213,41 @@ async function handleReviewsRequest(body) {
       }
       const status = await getThumbsUpStatus(body.contractorId, body.homeownerId);
       return { statusCode: 200, body: status };
+    }
+
+    // Write actions require a verified session.
+    const authUser = await getAuthedUser(req);
+    if (!authUser) {
+      return { statusCode: 401, body: { error: "You must be signed in." } };
+    }
+
+    // Derive homeownerId from the verified session.
+    const { data: homeownerRow } = await supabase
+      .from("homeowners").select("id").eq("auth_user_id", authUser.id).maybeSingle();
+    const homeownerId = homeownerRow?.id ?? null;
+
+    if (action === "create") {
+      if (!homeownerId) return { statusCode: 403, body: { error: "No homeowner profile found for this account." } };
+      const { contractorId, jobId, rating } = body;
+      if (!contractorId || !jobId || !rating) {
+        return { statusCode: 400, body: { error: "contractorId, jobId, and rating are required." } };
+      }
+      if (rating < 1 || rating > 5) {
+        return { statusCode: 400, body: { error: "rating must be between 1 and 5." } };
+      }
+      // homeownerId comes from the verified session, not the request body.
+      const review = await createReview({ contractorId, homeownerId, jobId, rating, text: body.text });
+      return { statusCode: 200, body: { review } };
+    }
+
+    if (action === "toggleThumbsUp") {
+      if (!homeownerId) return { statusCode: 403, body: { error: "No homeowner profile found for this account." } };
+      if (!body.contractorId) {
+        return { statusCode: 400, body: { error: "contractorId is required." } };
+      }
+      // homeownerId comes from the verified session.
+      const result = await toggleThumbsUp(body.contractorId, homeownerId);
+      return { statusCode: 200, body: result };
     }
 
     return { statusCode: 400, body: { error: `Unknown action: ${action}` } };
@@ -246,7 +271,7 @@ module.exports = async function handler(req, res) {
     res.status(405).json({ error: "Method not allowed" });
     return;
   }
-  const result = await handleReviewsRequest(req.body);
+  const result = await handleReviewsRequest(req.body, req);
   res.status(result.statusCode).json(result.body);
 };
 
