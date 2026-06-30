@@ -308,7 +308,7 @@ module.exports = async function handler(req, res) {
   // with no further detail.
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
 
   // Browsers send a preflight OPTIONS request before the real POST to ask
   // "are you okay with this?" -- must answer it directly, not run real logic.
