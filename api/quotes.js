@@ -22,19 +22,6 @@ const { createClient } = require("@supabase/supabase-js");
 
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SECRET_KEY);
 
-/**
- * Every id column in this database (homeowners.id, contractors.id,
- * quote_requests.id, etc.) is int8 (a plain number), since that's what
- * Supabase creates by default for a brand-new table -- not a uuid. IDs
- * arriving from the frontend over JSON are always strings (JSON has no way
- * to guarantee a number stays a number across an HTTP boundary the way the
- * frontend originally typed it). Comparing a string against an int8 column
- * with .eq() can silently fail to match depending on which part of the
- * query layer does the comparison -- which is exactly what caused quote
- * requests to come back with no recipients, and listForHomeowner to return
- * every homeowner's requests instead of just one. Always convert through
- * this function before using an id in a query.
- */
 function toId(value) {
   if (value === null || value === undefined || value === "") return value;
   const n = Number(value);
@@ -66,11 +53,6 @@ function rowToQuoteRequest(row, recipients) {
   };
 }
 
-/**
- * Creates one quote_requests row, plus one quote_recipients row per
- * contractor selected -- mirrors the original "fan out to multiple
- * contractors from a single request" behavior from the in-memory prototype.
- */
 async function createQuoteRequest({ homeownerId, description, budget, timeline, zip, contractorIds }) {
   const { data: qr, error: qrError } = await supabase
     .from("quote_requests")
@@ -125,7 +107,6 @@ async function listQuoteRequestsForContractor(contractorId) {
   return attachRecipients(requests);
 }
 
-/** Shared helper: given a list of quote_requests rows, fetch and attach their recipients. */
 async function attachRecipients(requests) {
   if (requests.length === 0) return [];
   const requestIds = requests.map((r) => toId(r.id));
@@ -223,7 +204,7 @@ async function handleQuotesRequest(body) {
 module.exports = async function handler(req, res) {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
 
   if (req.method === "OPTIONS") {
     res.status(200).end();
