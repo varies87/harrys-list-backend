@@ -2,9 +2,16 @@
  * api/jobs.js
  * ---------------------------------------------------------------------------
  * Backend endpoint for completed jobs: a contractor reporting a job done
- * (with the final amount), a homeowner confirming or disputing that amount,
- * and marking a job's fee as paid (called after a successful Stripe charge,
- * via create-payment-intent.js's companion confirm step -- see note below).
+ * (with the final amount), a homeowner confirming or disputing that amount.
+ * Marking a job's fee as paid is handled separately by api/webhook.js, which
+ * Stripe calls directly (server-to-server) once a payment genuinely
+ * succeeds -- there is intentionally no "mark this job paid" action in this
+ * file. A direct frontend-callable markPaid action used to exist here but
+ * was removed: it could be called by anyone editing browser JavaScript to
+ * fake a payment without ever charging a card, which defeats the entire
+ * point of charging a platform fee. See api/webhook.js for how paid status
+ * is actually set now, including signature verification that proves an
+ * event genuinely came from Stripe.
  *
  * Routes (distinguished by `action` in the request body):
  *   POST /api/jobs  { action: "report", contractorId, quoteRequestId, homeownerId, description, reportedAmount, lowReportReason? }
@@ -12,19 +19,10 @@
  *   POST /api/jobs  { action: "listForHomeowner", homeownerId }
  *   POST /api/jobs  { action: "confirm", jobId }
  *   POST /api/jobs  { action: "dispute", jobId, note }
- *   POST /api/jobs  { action: "markPaid", jobId }
- *   POST /api/jobs  { action: "listLowReportContractors" }              <- new, admin only
- *   POST /api/jobs  { action: "setAdminReviewStatus", contractorId, status }  <- new, admin only
+ *   POST /api/jobs  { action: "listLowReportContractors" }              <- admin only
+ *   POST /api/jobs  { action: "setAdminReviewStatus", contractorId, status }  <- admin only
  *   POST /api/jobs  { action: "editReportedAmount", jobId, newAmount, lowReportReason? }
  *   POST /api/jobs  { action: "listDisputedJobs" }                       <- admin only
- *
- * NOTE on markPaid: this version marks a job paid directly when called. In
- * production, prefer driving this from a Stripe webhook (a notification
- * Stripe sends your server when a charge actually succeeds) rather than
- * letting the frontend call it directly -- a webhook can't be faked by
- * someone editing browser JavaScript, whereas a direct frontend call
- * technically could be. Wiring up a webhook is a reasonable next step once
- * the rest of this is live and tested.
  *
  * ENVIRONMENT VARIABLES
  *   SUPABASE_URL
@@ -163,17 +161,6 @@ async function disputeJob(jobId, note) {
     .select()
     .single();
   if (error) throw new Error("Could not dispute job: " + error.message);
-  return rowToJob(data);
-}
-
-async function markJobPaid(jobId) {
-  const { data, error } = await supabase
-    .from("completed_jobs")
-    .update({ status: "paid", fee_paid: true, fee_paid_at: new Date().toISOString() })
-    .eq("id", toId(jobId))
-    .select()
-    .single();
-  if (error) throw new Error("Could not mark job paid: " + error.message);
   return rowToJob(data);
 }
 
@@ -400,12 +387,6 @@ async function handleJobsRequest(body) {
     if (action === "dispute") {
       if (!body.jobId) return { statusCode: 400, body: { error: "jobId is required." } };
       const job = await disputeJob(body.jobId, body.note);
-      return { statusCode: 200, body: { job } };
-    }
-
-    if (action === "markPaid") {
-      if (!body.jobId) return { statusCode: 400, body: { error: "jobId is required." } };
-      const job = await markJobPaid(body.jobId);
       return { statusCode: 200, body: { job } };
     }
 
