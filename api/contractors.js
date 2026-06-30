@@ -1,27 +1,31 @@
 /**
  * api/contractors.js
  * ---------------------------------------------------------------------------
- * Backend endpoint for everything contractor-related: listing approved
- * contractors for the homeowner directory, creating a new contractor profile
- * (signup), updating an existing one, and uploading a logo image.
+ * Backend endpoint for everything contractor-related. Real auth: a
+ * contractor signs up against Supabase Auth directly from the frontend
+ * (public anon key, see shared.js), which issues a session token. That
+ * token is verified server-side here before any profile-editing action
+ * runs -- "create my profile," "update my profile," and "upload my logo"
+ * are all scoped to whoever the token proves you are, never to a
+ * contractorId the client simply sends in the request body.
  *
- * Routes (all hit the same URL, distinguished by the `action` field in the
- * request body, since this keeps a single simple file instead of many tiny
- * ones -- a common pattern for small backends):
- *   POST /api/contractors  { action: "list" }
- *   POST /api/contractors  { action: "create", contractor: {...} }
- *   POST /api/contractors  { action: "update", contractorId, updates: {...} }
- *   POST /api/contractors  { action: "uploadLogo", contractorId, fileBase64, fileName }
- *   POST /api/contractors  { action: "listPending", adminPassword }
- *   POST /api/contractors  { action: "setStatus", adminPassword, contractorId, status }
+ * Public/admin-only routes (list, listPending, setStatus) are unchanged --
+ * those were never about "my own data" to begin with.
  *
- * ENVIRONMENT VARIABLES (same ones already set in Vercel for the payment function)
+ * Routes (distinguished by `action` in the request body):
+ *   POST /api/contractors  { action: "list" }                                   <- public, no auth needed
+ *   POST /api/contractors  { action: "getMine" }                                <- auth required
+ *   POST /api/contractors  { action: "create", contractor: {...} }              <- auth required, creates MY profile
+ *   POST /api/contractors  { action: "update", updates: {...} }                 <- auth required, updates MY profile
+ *   POST /api/contractors  { action: "uploadLogo", fileBase64, fileName }       <- auth required, for MY profile
+ *   POST /api/contractors  { action: "listPending", adminPassword }             <- admin only
+ *   POST /api/contractors  { action: "setStatus", adminPassword, contractorId, status }  <- admin only
+ *   POST /api/contractors  { action: "getWithReviews", contractorId }           <- public, no auth needed
+ *
+ * ENVIRONMENT VARIABLES
  *   SUPABASE_URL
  *   SUPABASE_SECRET_KEY
- *   ADMIN_PASSWORD   -- a password of your choosing, checked against the
- *                       "adminPassword" field on listPending/setStatus
- *                       requests. Set this in Vercel project settings, same
- *                       place as the other secrets -- never in code.
+ *   ADMIN_PASSWORD
  * ---------------------------------------------------------------------------
  */
 
@@ -29,34 +33,22 @@ const { createClient } = require("@supabase/supabase-js");
 
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SECRET_KEY);
 
-/**
- * See the matching comment in quotes.js -- ids are int8 (numbers) in the
- * database, but always arrive as strings from the frontend over JSON.
- */
 function toId(value) {
   if (value === null || value === undefined || value === "") return value;
   const n = Number(value);
   return Number.isNaN(n) ? value : n;
 }
 
-/**
- * Converts a DB row (snake_case) into the shape the frontend expects
- * (camelCase, with service area as a Set-friendly array).
- *
- * thumbsUp comes directly from contractors.thumbs_up_count -- a
- * denormalized counter kept in sync by reviews.js's toggleThumbsUp, so
- * every contractor in the directory list gets an accurate, live thumbs-up
- * count with zero extra queries. (Whether the CURRENT homeowner specifically
- * has thumbs-upped a given contractor is a separate, on-demand check --
- * see reviews.js's getThumbsUpStatus -- only needed when viewing one
- * contractor's profile, not for every card in the grid.)
- *
- * reviews is an optional second arg -- the directory listing (listContractors)
- * intentionally does NOT fetch full review text/ratings per-contractor to
- * keep that query fast; callers that need real review data (a contractor's
- * own profile, the profile modal) fetch it from reviews.js or
- * getContractorWithReviews below and merge it in. Defaults to [].
- */
+async function getAuthedUser(req) {
+  const authHeader = req.headers["authorization"] || req.headers["Authorization"];
+  if (!authHeader || !authHeader.startsWith("Bearer ")) return null;
+  const token = authHeader.slice("Bearer ".length);
+
+  const { data, error } = await supabase.auth.getUser(token);
+  if (error || !data?.user) return null;
+  return { id: data.user.id, email: data.user.email };
+}
+
 function rowToContractor(row, reviews) {
   return {
     id: row.id,
@@ -66,6 +58,7 @@ function rowToContractor(row, reviews) {
     yearsInBusiness: row.years_in_business,
     bio: row.bio,
     licenseInfo: row.license_info,
+    email: row.email,
     serviceArea: {
       mode: row.service_area_mode,
       zipCodes: row.service_area_zips ? row.service_area_zips.split(",").filter(Boolean) : [],
@@ -74,12 +67,11 @@ function rowToContractor(row, reviews) {
     thumbsUp: row.thumbs_up_count || 0,
     thumbsDown: row.thumbs_down || 0,
     logoUrl: row.logo_url || null,
-    completedJobs: [], // populated separately by the jobs endpoint
-    reviews: reviews || [], // populated separately by the reviews endpoint when needed
+    completedJobs: [],
+    reviews: reviews || [],
   };
 }
 
-/** Converts the frontend's contractor shape into DB columns for insert/update. */
 function contractorToRow(contractor) {
   const row = {};
   if (contractor.businessName !== undefined) row.business_name = contractor.businessName;
@@ -90,32 +82,23 @@ function contractorToRow(contractor) {
   if (contractor.serviceArea !== undefined) {
     row.service_area_mode = contractor.serviceArea.mode;
     const zips = contractor.serviceArea.zipCodes;
-    // Defensive: a Set sent from a client silently becomes {} once it
-    // crosses JSON (JSON.stringify(new Set()) === "{}"), which is not
-    // iterable and would crash a naive [...zips]. The frontend should
-    // always send a plain array, but never trust that blindly here --
-    // fall back to an empty list for anything that isn't a real array.
     row.service_area_zips = Array.isArray(zips) ? zips.join(",") : "";
   }
   if (contractor.status !== undefined) row.status = contractor.status;
-  if (contractor.thumbsUp !== undefined) row.thumbs_up = contractor.thumbsUp;
-  if (contractor.thumbsDown !== undefined) row.thumbs_down = contractor.thumbsDown;
   if (contractor.logoUrl !== undefined) row.logo_url = contractor.logoUrl;
   return row;
 }
 
 async function listContractors() {
-  const { data, error } = await supabase.from("contractors").select("*").order("created_at", { ascending: false });
+  const { data, error } = await supabase
+    .from("contractors")
+    .select("*")
+    .eq("status", "approved")
+    .order("created_at", { ascending: false });
   if (error) throw new Error("Could not list contractors: " + error.message);
   return data.map((row) => rowToContractor(row));
 }
 
-/**
- * Returns ONLY contractors with status "pending" -- used by the admin
- * approval screen. Requires the correct admin password (see
- * checkAdminPassword below) since this could otherwise be used to see
- * every pending signup, including ones not yet vetted.
- */
 async function listPendingContractors() {
   const { data, error } = await supabase
     .from("contractors")
@@ -126,46 +109,62 @@ async function listPendingContractors() {
   return data.map((row) => rowToContractor(row));
 }
 
-/**
- * Checks a password against ADMIN_PASSWORD, an environment variable set
- * directly in Vercel (never in code, same pattern as the Stripe/Supabase
- * secret keys). Returns true/false -- callers are responsible for returning
- * a 401 if this is false. This is intentionally simple (a single shared
- * password, not real per-admin accounts) since this is a one-person
- * operation right now; revisit if more than one person needs admin access.
- */
 function checkAdminPassword(password) {
   const realPassword = process.env.ADMIN_PASSWORD;
-  if (!realPassword) {
-    // Fail closed: if the env var was never set, nobody should be able to
-    // get in by guessing an empty string or similar.
-    return false;
-  }
+  if (!realPassword) return false;
   return password === realPassword;
 }
 
-async function createContractor(contractor) {
-  const row = contractorToRow({ ...contractor, status: contractor.status || "pending" });
+async function findContractorByAuthId(authUserId) {
+  const { data, error } = await supabase
+    .from("contractors")
+    .select("*")
+    .eq("auth_user_id", authUserId)
+    .maybeSingle();
+  if (error) throw new Error("Could not look up contractor profile: " + error.message);
+  return data ? rowToContractor(data) : null;
+}
+
+async function createContractorForAuthUser(authUser, contractor) {
+  const existing = await findContractorByAuthId(authUser.id);
+  if (existing) {
+    throw new Error("You already have a contractor profile. Use 'update' to edit it.");
+  }
+
+  const row = {
+    ...contractorToRow(contractor),
+    auth_user_id: authUser.id,
+    email: authUser.email,
+    status: "pending",
+  };
   const { data, error } = await supabase.from("contractors").insert(row).select().single();
-  if (error) throw new Error("Could not create contractor: " + error.message);
+  if (error) throw new Error("Could not create contractor profile: " + error.message);
   return rowToContractor(data);
 }
 
-async function updateContractor(contractorId, updates) {
+async function updateMyContractor(authUserId, updates) {
   const row = contractorToRow(updates);
-  const { data, error } = await supabase.from("contractors").update(row).eq("id", toId(contractorId)).select().single();
+  const { data, error } = await supabase
+    .from("contractors")
+    .update(row)
+    .eq("auth_user_id", authUserId)
+    .select()
+    .single();
   if (error) throw new Error("Could not update contractor: " + error.message);
   return rowToContractor(data);
 }
 
-/**
- * Looks up a single contractor by id, with their real reviews attached --
- * used for the profile modal and a contractor's own "viewing as" screen,
- * where seeing actual review text/ratings matters (unlike the directory
- * list, which intentionally skips fetching full reviews for speed -- see
- * the comment on rowToContractor). Thumbs-up count comes along for free
- * since it's a column on the contractors row itself.
- */
+async function setContractorStatus(contractorId, status) {
+  const { data, error } = await supabase
+    .from("contractors")
+    .update({ status })
+    .eq("id", toId(contractorId))
+    .select()
+    .single();
+  if (error) throw new Error("Could not update contractor status: " + error.message);
+  return rowToContractor(data);
+}
+
 async function getContractorWithReviews(contractorId) {
   const cId = toId(contractorId);
 
@@ -196,15 +195,16 @@ async function getContractorWithReviews(contractorId) {
   return rowToContractor(row, reviews);
 }
 
-/**
- * Uploads a logo image to Supabase Storage and saves its public URL onto
- * the contractor's row. fileBase64 should be a base64-encoded image (without
- * the "data:image/png;base64," prefix -- the frontend strips that before
- * sending, to keep the payload smaller and the backend simpler).
- */
-async function uploadLogo(contractorId, fileBase64, fileName, contentType) {
+async function uploadLogoForAuthUser(authUserId, fileBase64, fileName, contentType) {
+  const { data: existing, error: lookupError } = await supabase
+    .from("contractors")
+    .select("id")
+    .eq("auth_user_id", authUserId)
+    .single();
+  if (lookupError || !existing) throw new Error("You don't have a contractor profile yet.");
+
   const buffer = Buffer.from(fileBase64, "base64");
-  const path = `${contractorId}/${Date.now()}-${fileName}`;
+  const path = `${existing.id}/${Date.now()}-${fileName}`;
 
   const { error: uploadError } = await supabase.storage
     .from("contractor-logos")
@@ -217,7 +217,7 @@ async function uploadLogo(contractorId, fileBase64, fileName, contentType) {
   const { data, error } = await supabase
     .from("contractors")
     .update({ logo_url: logoUrl })
-    .eq("id", toId(contractorId))
+    .eq("id", existing.id)
     .select()
     .single();
   if (error) throw new Error("Could not save logo URL: " + error.message);
@@ -225,7 +225,7 @@ async function uploadLogo(contractorId, fileBase64, fileName, contentType) {
   return rowToContractor(data);
 }
 
-async function handleContractorsRequest(body) {
+async function handleContractorsRequest(body, req) {
   const { action } = body || {};
 
   try {
@@ -234,32 +234,11 @@ async function handleContractorsRequest(body) {
       return { statusCode: 200, body: { contractors } };
     }
 
-    if (action === "create") {
-      if (!body.contractor || !body.contractor.businessName) {
-        return { statusCode: 400, body: { error: "contractor.businessName is required." } };
-      }
-      const contractor = await createContractor(body.contractor);
-      return { statusCode: 200, body: { contractor } };
-    }
-
-    if (action === "update") {
+    if (action === "getWithReviews") {
       if (!body.contractorId) {
         return { statusCode: 400, body: { error: "contractorId is required." } };
       }
-      const contractor = await updateContractor(body.contractorId, body.updates || {});
-      return { statusCode: 200, body: { contractor } };
-    }
-
-    if (action === "uploadLogo") {
-      if (!body.contractorId || !body.fileBase64 || !body.fileName) {
-        return { statusCode: 400, body: { error: "contractorId, fileBase64, and fileName are required." } };
-      }
-      const contractor = await uploadLogo(
-        body.contractorId,
-        body.fileBase64,
-        body.fileName,
-        body.contentType || "image/png"
-      );
+      const contractor = await getContractorWithReviews(body.contractorId);
       return { statusCode: 200, body: { contractor } };
     }
 
@@ -281,15 +260,43 @@ async function handleContractorsRequest(body) {
       if (body.status !== "approved" && body.status !== "rejected") {
         return { statusCode: 400, body: { error: "status must be 'approved' or 'rejected'." } };
       }
-      const contractor = await updateContractor(body.contractorId, { status: body.status });
+      const contractor = await setContractorStatus(body.contractorId, body.status);
       return { statusCode: 200, body: { contractor } };
     }
 
-    if (action === "getWithReviews") {
-      if (!body.contractorId) {
-        return { statusCode: 400, body: { error: "contractorId is required." } };
+    const authUser = await getAuthedUser(req);
+    if (!authUser) {
+      return { statusCode: 401, body: { error: "You must be signed in." } };
+    }
+
+    if (action === "getMine") {
+      const contractor = await findContractorByAuthId(authUser.id);
+      return { statusCode: 200, body: { contractor } };
+    }
+
+    if (action === "create") {
+      if (!body.contractor || !body.contractor.businessName) {
+        return { statusCode: 400, body: { error: "contractor.businessName is required." } };
       }
-      const contractor = await getContractorWithReviews(body.contractorId);
+      const contractor = await createContractorForAuthUser(authUser, body.contractor);
+      return { statusCode: 200, body: { contractor } };
+    }
+
+    if (action === "update") {
+      const contractor = await updateMyContractor(authUser.id, body.updates || {});
+      return { statusCode: 200, body: { contractor } };
+    }
+
+    if (action === "uploadLogo") {
+      if (!body.fileBase64 || !body.fileName) {
+        return { statusCode: 400, body: { error: "fileBase64 and fileName are required." } };
+      }
+      const contractor = await uploadLogoForAuthUser(
+        authUser.id,
+        body.fileBase64,
+        body.fileName,
+        body.contentType || "image/png"
+      );
       return { statusCode: 200, body: { contractor } };
     }
 
@@ -301,17 +308,10 @@ async function handleContractorsRequest(body) {
 }
 
 module.exports = async function handler(req, res) {
-  // CORS: allow this function to be called from any origin, including the
-  // sandboxed iframe Claude's artifact viewer runs the frontend in. Without
-  // these headers, browsers block the request before it even reaches this
-  // code, often showing a generic "Load failed" or "Failed to fetch" error
-  // with no further detail.
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
 
-  // Browsers send a preflight OPTIONS request before the real POST to ask
-  // "are you okay with this?" -- must answer it directly, not run real logic.
   if (req.method === "OPTIONS") {
     res.status(200).end();
     return;
@@ -321,11 +321,10 @@ module.exports = async function handler(req, res) {
     res.status(405).json({ error: "Method not allowed" });
     return;
   }
-  const result = await handleContractorsRequest(req.body);
+  const result = await handleContractorsRequest(req.body, req);
   res.status(result.statusCode).json(result.body);
 };
 
-// Exported for testing.
 module.exports.handleContractorsRequest = handleContractorsRequest;
 module.exports.rowToContractor = rowToContractor;
 module.exports.contractorToRow = contractorToRow;
