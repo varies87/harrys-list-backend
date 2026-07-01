@@ -34,10 +34,33 @@ const { createClient } = require("@supabase/supabase-js");
 
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SECRET_KEY);
 
-function checkAdminPassword(password) {
+const adminAttempts = new Map();
+const MAX_ADMIN_ATTEMPTS = 5;
+const ADMIN_LOCKOUT_MS = 60 * 60 * 1000;
+
+function checkAdminPassword(password, req) {
+  const ip = (req && (req.headers["x-forwarded-for"] || req.socket?.remoteAddress)) || "unknown";
+  const now = Date.now();
+  const record = adminAttempts.get(ip);
+
+  if (record && record.count >= MAX_ADMIN_ATTEMPTS && now < record.resetAt) {
+    const minutesLeft = Math.ceil((record.resetAt - now) / 60000);
+    throw new Error(`Too many failed attempts. Try again in ${minutesLeft} minute${minutesLeft === 1 ? "" : "s"}.`);
+  }
+
+  if (record && now >= record.resetAt) adminAttempts.delete(ip);
+
   const realPassword = process.env.ADMIN_PASSWORD;
   if (!realPassword) return false;
-  return password === realPassword;
+
+  if (password === realPassword) {
+    adminAttempts.delete(ip);
+    return true;
+  }
+
+  const current = adminAttempts.get(ip) || { count: 0, resetAt: now + ADMIN_LOCKOUT_MS };
+  adminAttempts.set(ip, { count: current.count + 1, resetAt: current.resetAt });
+  return false;
 }
 
 
@@ -389,16 +412,24 @@ async function handleJobsRequest(body, req) {
   try {
     // Admin-only actions -- gated by ADMIN_PASSWORD, no session needed.
     if (action === "listLowReportContractors") {
-      if (!checkAdminPassword(body.adminPassword)) {
-        return { statusCode: 401, body: { error: "Incorrect admin password." } };
+      try {
+        if (!checkAdminPassword(body.adminPassword, req)) {
+          return { statusCode: 401, body: { error: "Incorrect admin password." } };
+        }
+      } catch (err) {
+        return { statusCode: 429, body: { error: err.message } };
       }
       const flagged = await listLowReportContractors();
       return { statusCode: 200, body: { flagged } };
     }
 
     if (action === "setAdminReviewStatus") {
-      if (!checkAdminPassword(body.adminPassword)) {
-        return { statusCode: 401, body: { error: "Incorrect admin password." } };
+      try {
+        if (!checkAdminPassword(body.adminPassword, req)) {
+          return { statusCode: 401, body: { error: "Incorrect admin password." } };
+        }
+      } catch (err) {
+        return { statusCode: 429, body: { error: err.message } };
       }
       if (!body.contractorId) return { statusCode: 400, body: { error: "contractorId is required." } };
       const result = await setAdminReviewStatus(body.contractorId, body.status ?? null);
@@ -406,8 +437,12 @@ async function handleJobsRequest(body, req) {
     }
 
     if (action === "listDisputedJobs") {
-      if (!checkAdminPassword(body.adminPassword)) {
-        return { statusCode: 401, body: { error: "Incorrect admin password." } };
+      try {
+        if (!checkAdminPassword(body.adminPassword, req)) {
+          return { statusCode: 401, body: { error: "Incorrect admin password." } };
+        }
+      } catch (err) {
+        return { statusCode: 429, body: { error: err.message } };
       }
       const disputed = await listDisputedJobs();
       return { statusCode: 200, body: { disputed } };
