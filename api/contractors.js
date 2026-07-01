@@ -286,6 +286,33 @@ async function deletePortfolioPhoto(authUserId, photoId) {
   return { deleted: true, photoId };
 }
 
+async function updatePortfolioPhotoCaption(authUserId, photoId, caption) {
+  const { data: contractor, error: lookupError } = await supabase
+    .from("contractors")
+    .select("id")
+    .eq("auth_user_id", authUserId)
+    .single();
+  if (lookupError || !contractor) throw new Error("Contractor profile not found.");
+
+  const { data: photo, error: photoError } = await supabase
+    .from("portfolio_photos")
+    .select("id, contractor_id")
+    .eq("id", toId(photoId))
+    .maybeSingle();
+  if (photoError) throw new Error("Could not find photo: " + photoError.message);
+  if (!photo) throw new Error("Photo not found.");
+  if (photo.contractor_id !== contractor.id) throw new Error("You can only edit your own photos.");
+
+  const { data, error } = await supabase
+    .from("portfolio_photos")
+    .update({ caption: caption || null })
+    .eq("id", toId(photoId))
+    .select()
+    .single();
+  if (error) throw new Error("Could not update caption: " + error.message);
+  return rowToPhoto(data);
+}
+
 
 
 async function getContractorWithReviews(contractorId) {
@@ -452,6 +479,14 @@ async function handleContractorsRequest(body, req) {
       }
       const result = await deletePortfolioPhoto(authUser.id, body.photoId);
       return { statusCode: 200, body: result };
+    }
+
+    if (action === "updatePhotoCaption") {
+      if (!body.photoId) {
+        return { statusCode: 400, body: { error: "photoId is required." } };
+      }
+      const photo = await updatePortfolioPhotoCaption(authUser.id, body.photoId, body.caption || null);
+      return { statusCode: 200, body: { photo } };
     }
 
     return { statusCode: 400, body: { error: `Unknown action: ${action}` } };
