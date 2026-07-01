@@ -67,6 +67,7 @@ function rowToContractor(row, reviews) {
       zipCodes: row.service_area_zips ? row.service_area_zips.split(",").filter(Boolean) : [],
     },
     status: row.status,
+    isSuspended: !!row.is_suspended,
     thumbsUp: row.thumbs_up_count || 0,
     thumbsDown: row.thumbs_down || 0,
     logoUrl: row.logo_url || null,
@@ -97,6 +98,7 @@ async function listContractors() {
     .from("contractors")
     .select("*")
     .eq("status", "approved")
+    .eq("is_suspended", false)
     .order("created_at", { ascending: false });
   if (error) throw new Error("Could not list contractors: " + error.message);
   return data.map((row) => rowToContractor(row));
@@ -112,10 +114,42 @@ async function listPendingContractors() {
   return data.map((row) => rowToContractor(row));
 }
 
-function checkAdminPassword(password) {
+// In-memory rate limiter for admin password attempts.
+// Vercel serverless functions are stateless across requests, so this resets
+// on cold starts -- but it still catches rapid brute-force attempts within
+// the same function instance's lifetime, which covers the main attack vector.
+const adminAttempts = new Map(); // ip -> { count, resetAt }
+const MAX_ADMIN_ATTEMPTS = 5;
+const ADMIN_LOCKOUT_MS = 60 * 60 * 1000; // 1 hour
+
+function checkAdminPassword(password, req) {
+  const ip = (req && (req.headers["x-forwarded-for"] || req.socket?.remoteAddress)) || "unknown";
+  const now = Date.now();
+  const record = adminAttempts.get(ip);
+
+  // Check if currently locked out
+  if (record && record.count >= MAX_ADMIN_ATTEMPTS && now < record.resetAt) {
+    const minutesLeft = Math.ceil((record.resetAt - now) / 60000);
+    throw new Error(`Too many failed attempts. Try again in ${minutesLeft} minute${minutesLeft === 1 ? "" : "s"}.`);
+  }
+
+  // Reset if lockout period has expired
+  if (record && now >= record.resetAt) {
+    adminAttempts.delete(ip);
+  }
+
   const realPassword = process.env.ADMIN_PASSWORD;
   if (!realPassword) return false;
-  return password === realPassword;
+
+  if (password === realPassword) {
+    adminAttempts.delete(ip); // clear on success
+    return true;
+  }
+
+  // Wrong password -- increment attempt count
+  const current = adminAttempts.get(ip) || { count: 0, resetAt: now + ADMIN_LOCKOUT_MS };
+  adminAttempts.set(ip, { count: current.count + 1, resetAt: current.resetAt });
+  return false;
 }
 
 async function findContractorByAuthId(authUserId) {
@@ -401,16 +435,24 @@ async function handleContractorsRequest(body, req) {
     }
 
     if (action === "listPending") {
-      if (!checkAdminPassword(body.adminPassword)) {
-        return { statusCode: 401, body: { error: "Incorrect admin password." } };
+      try {
+        if (!checkAdminPassword(body.adminPassword, req)) {
+          return { statusCode: 401, body: { error: "Incorrect admin password." } };
+        }
+      } catch (err) {
+        return { statusCode: 429, body: { error: err.message } };
       }
       const contractors = await listPendingContractors();
       return { statusCode: 200, body: { contractors } };
     }
 
     if (action === "setStatus") {
-      if (!checkAdminPassword(body.adminPassword)) {
-        return { statusCode: 401, body: { error: "Incorrect admin password." } };
+      try {
+        if (!checkAdminPassword(body.adminPassword, req)) {
+          return { statusCode: 401, body: { error: "Incorrect admin password." } };
+        }
+      } catch (err) {
+        return { statusCode: 429, body: { error: err.message } };
       }
       if (!body.contractorId || !body.status) {
         return { statusCode: 400, body: { error: "contractorId and status are required." } };
