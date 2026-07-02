@@ -347,6 +347,17 @@ async function handleQuotesRequest(body, req) {
       if (String(qr.homeowner_id) !== String(homeownerId)) {
         return { statusCode: 403, body: { error: "This quote request doesn't belong to your account." } };
       }
+      // Verify the contractor actually responded (not just received the request)
+      const { data: recipient, error: recipientError } = await supabase
+        .from("quote_recipients")
+        .select("status")
+        .eq("quote_request_id", toId(quoteRequestId))
+        .eq("contractor_id", toId(targetContractorId))
+        .maybeSingle();
+      if (recipientError || !recipient) return { statusCode: 404, body: { error: "Recipient not found." } };
+      if (recipient.status !== "responded") {
+        return { statusCode: 400, body: { error: "Can only mark a job complete after the contractor has responded with a quote." } };
+      }
       const { error } = await supabase
         .from("quote_recipients")
         .update({
