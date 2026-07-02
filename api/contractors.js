@@ -111,7 +111,23 @@ async function listContractors() {
     .eq("is_suspended", false)
     .order("created_at", { ascending: false });
   if (error) throw new Error("Could not list contractors: " + error.message);
-  return data.map((row) => rowToContractor(row));
+  if (data.length === 0) return [];
+
+  // Fetch all reviews for listed contractors in one query
+  const contractorIds = data.map((c) => c.id);
+  const { data: reviewRows } = await supabase
+    .from("reviews")
+    .select("contractor_id, rating")
+    .in("contractor_id", contractorIds);
+
+  // Group reviews by contractor
+  const reviewsByContractor = new Map();
+  (reviewRows || []).forEach((r) => {
+    if (!reviewsByContractor.has(r.contractor_id)) reviewsByContractor.set(r.contractor_id, []);
+    reviewsByContractor.get(r.contractor_id).push({ rating: r.rating });
+  });
+
+  return data.map((row) => rowToContractor(row, reviewsByContractor.get(row.id) || []));
 }
 
 async function listPendingContractors() {
