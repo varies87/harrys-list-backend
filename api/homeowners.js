@@ -139,8 +139,8 @@ async function handleHomeownersRequest(body, req) {
     }
 
     if (action === "afterSignUp") {
-      if (!body.name || !body.zip) {
-        return { statusCode: 400, body: { error: "name and zip are required." } };
+      if (!body.name || !body.zip || !body.phone) {
+        return { statusCode: 400, body: { error: "name, zip, and phone are required." } };
       }
       const existing = await findHomeownerByAuthId(authUser.id);
       if (existing) {
