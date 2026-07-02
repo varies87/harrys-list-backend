@@ -425,6 +425,83 @@ async function listUnreportedCompletions() {
   });
 }
 
+async function getMetrics() {
+  const [
+    { count: totalContractors },
+    { count: pendingContractors },
+    { count: suspendedContractors },
+    { count: totalHomeowners },
+    { count: totalQuoteRequests },
+    { data: jobs },
+    { data: recentHomeowners },
+    { data: recentContractors },
+  ] = await Promise.all([
+    supabase.from("contractors").select("*", { count: "exact", head: true }).eq("status", "approved"),
+    supabase.from("contractors").select("*", { count: "exact", head: true }).eq("status", "pending"),
+    supabase.from("contractors").select("*", { count: "exact", head: true }).eq("is_suspended", true),
+    supabase.from("homeowners").select("*", { count: "exact", head: true }),
+    supabase.from("quote_requests").select("*", { count: "exact", head: true }),
+    supabase.from("completed_jobs").select("reported_amount, status, fee_paid, fee_paid_at, confirmed_at, created_at"),
+    supabase.from("homeowners").select("created_at").gte("created_at", new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString()),
+    supabase.from("contractors").select("created_at").gte("created_at", new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString()),
+  ]);
+
+  const allJobs = jobs || [];
+  const confirmedJobs = allJobs.filter((j) => j.status === "confirmed" || j.status === "paid");
+  const paidJobs = allJobs.filter((j) => j.status === "paid" && j.fee_paid);
+  const overdueJobs = confirmedJobs.filter((j) => !j.fee_paid && j.confirmed_at && new Date(j.confirmed_at) < new Date(Date.now() - 10 * 24 * 60 * 60 * 1000));
+
+  // Calculate fees using the same bracket logic as create-payment-intent.js
+  const FEE_BRACKETS = [
+    { upTo: 500, rate: 0.04 },
+    { upTo: 2500, rate: 0.03 },
+    { upTo: 10000, rate: 0.02 },
+    { upTo: Infinity, rate: 0.01 },
+  ];
+  function feeFor(amount) {
+    let owed = 0; let lower = 0;
+    for (const b of FEE_BRACKETS) {
+      if (amount <= lower) break;
+      owed += (Math.min(amount, b.upTo) - lower) * b.rate;
+      lower = b.upTo;
+    }
+    return owed;
+  }
+
+  const feesCollected = paidJobs.reduce((s, j) => s + feeFor(Number(j.reported_amount)), 0);
+  const feesPending = confirmedJobs.filter((j) => !j.fee_paid).reduce((s, j) => s + feeFor(Number(j.reported_amount)), 0);
+
+  // This month fees
+  const thisMonth = new Date(); thisMonth.setDate(1); thisMonth.setHours(0,0,0,0);
+  const feesThisMonth = paidJobs
+    .filter((j) => j.fee_paid_at && new Date(j.fee_paid_at) >= thisMonth)
+    .reduce((s, j) => s + feeFor(Number(j.reported_amount)), 0);
+
+  return {
+    contractors: {
+      total: totalContractors || 0,
+      pending: pendingContractors || 0,
+      suspended: suspendedContractors || 0,
+      newThisMonth: (recentContractors || []).length,
+    },
+    homeowners: {
+      total: totalHomeowners || 0,
+      newThisMonth: (recentHomeowners || []).length,
+    },
+    transactions: {
+      totalQuoteRequests: totalQuoteRequests || 0,
+      completedJobs: confirmedJobs.length,
+      paidJobs: paidJobs.length,
+      overdueJobs: overdueJobs.length,
+    },
+    revenue: {
+      feesCollected: Math.round(feesCollected * 100) / 100,
+      feesPending: Math.round(feesPending * 100) / 100,
+      feesThisMonth: Math.round(feesThisMonth * 100) / 100,
+    },
+  };
+}
+
 async function setAdminReviewStatus(contractorId, status) {
   const allowed = [null, "warned", "suspended"];
   if (!allowed.includes(status)) {
@@ -511,6 +588,18 @@ async function handleJobsRequest(body, req) {
       return { statusCode: 200, body: { disputed } };
     }
 
+    if (action === "getMetrics") {
+      try {
+        if (!checkAdminPassword(body.adminPassword, req)) {
+          return { statusCode: 401, body: { error: "Incorrect admin password." } };
+        }
+      } catch (err) {
+        return { statusCode: 429, body: { error: err.message } };
+      }
+      const metrics = await getMetrics();
+      return { statusCode: 200, body: { metrics } };
+    }
+
     if (action === "listUnreportedCompletions") {
       try {
         if (!checkAdminPassword(body.adminPassword, req)) {
@@ -537,8 +626,20 @@ async function handleJobsRequest(body, req) {
       if (!description || !reportedAmount) {
         return { statusCode: 400, body: { error: "description and reportedAmount are required." } };
       }
-      // contractorId comes from the verified session, not the request body.
-      const job = await reportJob({ contractorId, quoteRequestId, homeownerId: body.homeownerId, description, reportedAmount, lowReportReason });
+      // Derive homeownerId from the quote request server-side -- never trust client body
+      let derivedHomeownerId = null;
+      if (quoteRequestId) {
+        const { data: qr } = await supabase
+          .from("quote_requests")
+          .select("homeowner_id")
+          .eq("id", toId(quoteRequestId))
+          .maybeSingle();
+        derivedHomeownerId = qr?.homeowner_id ?? null;
+      }
+      if (!derivedHomeownerId) {
+        return { statusCode: 400, body: { error: "Could not determine homeowner for this job. Make sure quoteRequestId is provided." } };
+      }
+      const job = await reportJob({ contractorId, quoteRequestId, homeownerId: derivedHomeownerId, description, reportedAmount, lowReportReason });
       return { statusCode: 200, body: { job } };
     }
 
