@@ -52,9 +52,19 @@ async function getAuthedUser(req) {
   return { id: data.user.id, email: data.user.email };
 }
 
+function generateSlug(businessName) {
+  return businessName
+    .toLowerCase()
+    .trim()
+    .replace(/[^a-z0-9\s-]/g, "")
+    .replace(/\s+/g, "-")
+    .replace(/-+/g, "-");
+}
+
 function rowToContractor(row, reviews) {
   return {
     id: row.id,
+    slug: row.slug || null,
     createdAt: row.created_at,
     businessName: row.business_name,
     trade: row.trade,
@@ -168,11 +178,24 @@ async function createContractorForAuthUser(authUser, contractor) {
     throw new Error("You already have a contractor profile. Use 'update' to edit it.");
   }
 
+  // Generate a unique slug from the business name
+  const baseSlug = generateSlug(contractor.businessName);
+  let slug = baseSlug;
+  let attempt = 0;
+  while (true) {
+    const { data: conflict } = await supabase
+      .from("contractors").select("id").eq("slug", slug).maybeSingle();
+    if (!conflict) break;
+    attempt++;
+    slug = `${baseSlug}-${attempt}`;
+  }
+
   const row = {
     ...contractorToRow(contractor),
     auth_user_id: authUser.id,
     email: authUser.email,
     status: "pending",
+    slug,
   };
   const { data, error } = await supabase.from("contractors").insert(row).select().single();
   if (error) throw new Error("Could not create contractor profile: " + error.message);
@@ -181,6 +204,20 @@ async function createContractorForAuthUser(authUser, contractor) {
 
 async function updateMyContractor(authUserId, updates) {
   const row = contractorToRow(updates);
+  // If business name changed, regenerate slug
+  if (updates.businessName) {
+    const baseSlug = generateSlug(updates.businessName);
+    let slug = baseSlug;
+    let attempt = 0;
+    while (true) {
+      const { data: conflict } = await supabase
+        .from("contractors").select("id").eq("slug", slug).maybeSingle();
+      if (!conflict) break;
+      attempt++;
+      slug = `${baseSlug}-${attempt}`;
+    }
+    row.slug = slug;
+  }
   const { data, error } = await supabase
     .from("contractors")
     .update(row)
@@ -419,18 +456,35 @@ async function handleContractorsRequest(body, req) {
     }
 
     if (action === "getWithReviews") {
-      if (!body.contractorId) {
-        return { statusCode: 400, body: { error: "contractorId is required." } };
+      // Accepts either contractorId (numeric) or slug (string)
+      const { contractorId, slug } = body;
+      if (!contractorId && !slug) {
+        return { statusCode: 400, body: { error: "contractorId or slug is required." } };
       }
-      const contractor = await getContractorWithReviews(body.contractorId);
+      let lookupId = contractorId;
+      if (!lookupId && slug) {
+        // Look up id by slug
+        const { data: row, error: slugError } = await supabase
+          .from("contractors").select("id").eq("slug", slug).maybeSingle();
+        if (slugError || !row) return { statusCode: 404, body: { error: "Contractor not found." } };
+        lookupId = row.id;
+      }
+      const contractor = await getContractorWithReviews(lookupId);
       return { statusCode: 200, body: { contractor } };
     }
 
     if (action === "listPortfolioPhotos") {
-      if (!body.contractorId) {
-        return { statusCode: 400, body: { error: "contractorId is required." } };
+      const { contractorId, slug } = body;
+      if (!contractorId && !slug) {
+        return { statusCode: 400, body: { error: "contractorId or slug is required." } };
       }
-      const photos = await listPortfolioPhotos(body.contractorId);
+      let lookupId = contractorId;
+      if (!lookupId && slug) {
+        const { data: row } = await supabase.from("contractors").select("id").eq("slug", slug).maybeSingle();
+        if (!row) return { statusCode: 404, body: { error: "Contractor not found." } };
+        lookupId = row.id;
+      }
+      const photos = await listPortfolioPhotos(lookupId);
       return { statusCode: 200, body: { photos } };
     }
 
