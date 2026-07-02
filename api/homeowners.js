@@ -32,6 +32,7 @@ function rowToHomeowner(row) {
     name: row.name,
     email: row.email,
     zip: row.zip,
+    phone: row.phone || null,
     favoriteContractorIds: row.favorite_contractor_ids
       ? row.favorite_contractor_ids.split(",").filter(Boolean)
       : [],
@@ -65,7 +66,7 @@ async function findHomeownerByAuthId(authUserId) {
   return data ? rowToHomeowner(data) : null;
 }
 
-async function createHomeownerForAuthUser(authUser, name, zip) {
+async function createHomeownerForAuthUser(authUser, name, zip, phone) {
   const { data, error } = await supabase
     .from("homeowners")
     .insert({
@@ -73,6 +74,7 @@ async function createHomeownerForAuthUser(authUser, name, zip) {
       name: name.trim(),
       email: authUser.email,
       zip: zip.trim(),
+      phone: phone || null,
       favorite_contractor_ids: "",
     })
     .select()
@@ -90,6 +92,7 @@ async function updateHomeowner(authUserId, updates) {
   const row = {};
   if (updates.name !== undefined) row.name = updates.name;
   if (updates.zip !== undefined) row.zip = updates.zip;
+  if (updates.phone !== undefined) row.phone = updates.phone || null;
 
   const { data, error } = await supabase
     .from("homeowners")
@@ -143,7 +146,7 @@ async function handleHomeownersRequest(body, req) {
       if (existing) {
         return { statusCode: 200, body: { homeowner: existing } };
       }
-      const homeowner = await createHomeownerForAuthUser(authUser, body.name, body.zip);
+      const homeowner = await createHomeownerForAuthUser(authUser, body.name, body.zip, body.phone || null);
       return { statusCode: 200, body: { homeowner } };
     }
 
