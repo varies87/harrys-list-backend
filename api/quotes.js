@@ -123,6 +123,20 @@ async function attachRecipients(requests) {
 }
 
 async function respondToQuote(quoteRequestId, contractorId, status, price, message) {
+  // Only allow responding if currently in 'sent' status
+  // Prevents un-declining or overwriting an existing quote
+  const { data: existing } = await supabase
+    .from("quote_recipients")
+    .select("status")
+    .eq("quote_request_id", toId(quoteRequestId))
+    .eq("contractor_id", toId(contractorId))
+    .maybeSingle();
+
+  if (!existing) throw new Error("Quote recipient not found.");
+  if (existing.status !== "sent") {
+    throw new Error("This quote request has already been responded to or declined.");
+  }
+
   const updates = { status };
   if (status === "responded") {
     updates.quote_price = price;
