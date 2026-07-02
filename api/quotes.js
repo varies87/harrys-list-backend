@@ -55,6 +55,23 @@ function rowToQuoteRequest(row, recipients) {
 }
 
 async function createQuoteRequest({ homeownerId, description, budget, timeline, zip, contractorIds }) {
+  // Check for existing open requests to the same contractors from this homeowner
+  // to prevent accidental duplicate submissions
+  const { data: existingRecipients } = await supabase
+    .from("quote_recipients")
+    .select("contractor_id, quote_requests!inner(homeowner_id)")
+    .eq("quote_requests.homeowner_id", toId(homeownerId))
+    .in("contractor_id", contractorIds.map(toId))
+    .in("status", ["sent", "responded"]);
+
+  if (existingRecipients && existingRecipients.length > 0) {
+    const duplicateIds = existingRecipients.map((r) => r.contractor_id);
+    const duplicateContractors = contractorIds.filter((id) => duplicateIds.some((d) => String(d) === String(id)));
+    if (duplicateContractors.length > 0) {
+      throw new Error("You already have an open quote request with one or more of these contractors. Check your existing requests before sending a new one.");
+    }
+  }
+
   const { data: qr, error: qrError } = await supabase
     .from("quote_requests")
     .insert({ homeowner_id: toId(homeownerId), description, budget, timeline, zip })
