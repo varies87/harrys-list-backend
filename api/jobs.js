@@ -362,6 +362,55 @@ async function listDisputedJobs() {
     };
   });
 }
+async function listUnreportedCompletions() {
+  // Find quote recipients where homeowner marked complete but contractor never reported
+  const { data: recipients, error } = await supabase
+    .from("quote_recipients")
+    .select("quote_request_id, contractor_id, homeowner_marked_complete_at")
+    .eq("homeowner_marked_complete", true)
+    .eq("job_reported", false)
+    .order("homeowner_marked_complete_at", { ascending: false });
+  if (error) throw new Error("Could not fetch unreported completions: " + error.message);
+  if (!recipients || recipients.length === 0) return [];
+
+  const qrIds = [...new Set(recipients.map((r) => r.quote_request_id))];
+  const contractorIds = [...new Set(recipients.map((r) => r.contractor_id))];
+
+  const [{ data: qrs }, { data: contractors }] = await Promise.all([
+    supabase.from("quote_requests").select("id, description, homeowner_id").in("id", qrIds),
+    supabase.from("contractors").select("id, business_name, trade, email").in("id", contractorIds),
+  ]);
+
+  const homeownerIds = [...new Set((qrs || []).map((q) => q.homeowner_id))];
+  const { data: homeowners } = await supabase
+    .from("homeowners").select("id, name, email").in("id", homeownerIds);
+
+  const qrById = new Map((qrs || []).map((q) => [q.id, q]));
+  const contractorById = new Map((contractors || []).map((c) => [c.id, c]));
+  const homeownerById = new Map((homeowners || []).map((h) => [h.id, h]));
+
+  return recipients.map((r) => {
+    const qr = qrById.get(r.quote_request_id);
+    const contractor = contractorById.get(r.contractor_id);
+    const homeowner = qr ? homeownerById.get(qr.homeowner_id) : null;
+    return {
+      quoteRequestId: r.quote_request_id,
+      contractorId: r.contractor_id,
+      markedCompleteAt: r.homeowner_marked_complete_at,
+      description: qr?.description || "—",
+      contractor: {
+        businessName: contractor?.business_name,
+        trade: contractor?.trade,
+        email: contractor?.email,
+      },
+      homeowner: {
+        name: homeowner?.name,
+        email: homeowner?.email,
+      },
+    };
+  });
+}
+
 async function setAdminReviewStatus(contractorId, status) {
   const allowed = [null, "warned", "suspended"];
   if (!allowed.includes(status)) {
@@ -446,6 +495,18 @@ async function handleJobsRequest(body, req) {
       }
       const disputed = await listDisputedJobs();
       return { statusCode: 200, body: { disputed } };
+    }
+
+    if (action === "listUnreportedCompletions") {
+      try {
+        if (!checkAdminPassword(body.adminPassword, req)) {
+          return { statusCode: 401, body: { error: "Incorrect admin password." } };
+        }
+      } catch (err) {
+        return { statusCode: 429, body: { error: err.message } };
+      }
+      const unreported = await listUnreportedCompletions();
+      return { statusCode: 200, body: { unreported } };
     }
 
     // All other actions require a verified session.
