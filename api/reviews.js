@@ -208,10 +208,21 @@ async function handleReviewsRequest(body, req) {
     }
 
     if (action === "getThumbsUpStatus") {
-      if (!body.contractorId || !body.homeownerId) {
-        return { statusCode: 400, body: { error: "contractorId and homeownerId are required." } };
+      if (!body.contractorId) {
+        return { statusCode: 400, body: { error: "contractorId is required." } };
       }
-      const status = await getThumbsUpStatus(body.contractorId, body.homeownerId);
+      // Derive homeownerId from session -- don't trust client-supplied value
+      const authUser = await getAuthedUser(req);
+      let homeownerId = null;
+      if (authUser) {
+        const { data: homeownerRow } = await supabase
+          .from("homeowners").select("id").eq("auth_user_id", authUser.id).maybeSingle();
+        homeownerId = homeownerRow?.id ?? null;
+      }
+      if (!homeownerId) {
+        return { statusCode: 200, body: { alreadyThumbsUpped: false } };
+      }
+      const status = await getThumbsUpStatus(body.contractorId, homeownerId);
       return { statusCode: 200, body: status };
     }
 
