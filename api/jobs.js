@@ -51,7 +51,10 @@ function checkAdminPassword(password, req) {
   if (record && now >= record.resetAt) adminAttempts.delete(ip);
 
   const realPassword = process.env.ADMIN_PASSWORD;
-  if (!realPassword) return false;
+  if (!realPassword) {
+    console.error("WARNING: ADMIN_PASSWORD environment variable is not set. Admin panel will be inaccessible.");
+    return false;
+  }
 
   if (password === realPassword) {
     adminAttempts.delete(ip);
