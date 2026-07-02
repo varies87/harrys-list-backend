@@ -165,7 +165,10 @@ function checkAdminPassword(password, req) {
   }
 
   const realPassword = process.env.ADMIN_PASSWORD;
-  if (!realPassword) return false;
+  if (!realPassword) {
+    console.error("WARNING: ADMIN_PASSWORD environment variable is not set. Admin panel will be inaccessible.");
+    return false;
+  }
 
   if (password === realPassword) {
     adminAttempts.delete(ip); // clear on success
@@ -220,20 +223,9 @@ async function createContractorForAuthUser(authUser, contractor) {
 
 async function updateMyContractor(authUserId, updates) {
   const row = contractorToRow(updates);
-  // If business name changed, regenerate slug
-  if (updates.businessName) {
-    const baseSlug = generateSlug(updates.businessName);
-    let slug = baseSlug;
-    let attempt = 0;
-    while (true) {
-      const { data: conflict } = await supabase
-        .from("contractors").select("id").eq("slug", slug).maybeSingle();
-      if (!conflict) break;
-      attempt++;
-      slug = `${baseSlug}-${attempt}`;
-    }
-    row.slug = slug;
-  }
+  // Deliberately do NOT regenerate slug on business name change --
+  // the slug is set once at creation and never changes so existing
+  // shared links and QR codes keep working.
   const { data, error } = await supabase
     .from("contractors")
     .update(row)
@@ -412,6 +404,11 @@ async function getContractorWithReviews(contractorId) {
     .single();
   if (rowError) throw new Error("Could not find contractor: " + rowError.message);
 
+  // Don't expose suspended or unapproved contractors on public profiles
+  if (row.status !== "approved" || row.is_suspended) {
+    throw new Error("This contractor profile is not publicly available.");
+  }
+
   const { data: reviewRows, error: reviewsError } = await supabase
     .from("reviews")
     .select("*")
@@ -548,12 +545,25 @@ async function handleContractorsRequest(body, req) {
       if (!body.contractor || !body.contractor.businessName) {
         return { statusCode: 400, body: { error: "contractor.businessName is required." } };
       }
+      if (body.contractor.businessName.length > 100) {
+        return { statusCode: 400, body: { error: "Business name must be 100 characters or less." } };
+      }
+      if (body.contractor.bio && body.contractor.bio.length > 2000) {
+        return { statusCode: 400, body: { error: "Bio must be 2000 characters or less." } };
+      }
       const contractor = await createContractorForAuthUser(authUser, body.contractor);
       return { statusCode: 200, body: { contractor } };
     }
 
     if (action === "update") {
-      const contractor = await updateMyContractor(authUser.id, body.updates || {});
+      const updates = body.updates || {};
+      if (updates.businessName && updates.businessName.length > 100) {
+        return { statusCode: 400, body: { error: "Business name must be 100 characters or less." } };
+      }
+      if (updates.bio && updates.bio.length > 2000) {
+        return { statusCode: 400, body: { error: "Bio must be 2000 characters or less." } };
+      }
+      const contractor = await updateMyContractor(authUser.id, updates);
       return { statusCode: 200, body: { contractor } };
     }
 
