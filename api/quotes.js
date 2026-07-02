@@ -33,6 +33,7 @@ function rowToRecipient(row) {
     contractorId: row.contractor_id,
     status: row.status,
     jobReported: !!row.job_reported,
+    homeownerMarkedComplete: !!row.homeowner_marked_complete,
     quote:
       row.quote_price != null
         ? { price: Number(row.quote_price), message: row.quote_message || "" }
@@ -330,6 +331,33 @@ async function handleQuotesRequest(body, req) {
       return { statusCode: 200, body: { photo } };
     }
 
+    if (action === "markComplete") {
+      if (!homeownerId) return { statusCode: 403, body: { error: "No homeowner profile found for this account." } };
+      const { quoteRequestId, contractorId: targetContractorId } = body;
+      if (!quoteRequestId || !targetContractorId) {
+        return { statusCode: 400, body: { error: "quoteRequestId and contractorId are required." } };
+      }
+      // Verify this quote request belongs to this homeowner
+      const { data: qr, error: qrError } = await supabase
+        .from("quote_requests")
+        .select("homeowner_id")
+        .eq("id", toId(quoteRequestId))
+        .maybeSingle();
+      if (qrError || !qr) return { statusCode: 404, body: { error: "Quote request not found." } };
+      if (String(qr.homeowner_id) !== String(homeownerId)) {
+        return { statusCode: 403, body: { error: "This quote request doesn't belong to your account." } };
+      }
+      const { error } = await supabase
+        .from("quote_recipients")
+        .update({
+          homeowner_marked_complete: true,
+          homeowner_marked_complete_at: new Date().toISOString(),
+        })
+        .eq("quote_request_id", toId(quoteRequestId))
+        .eq("contractor_id", toId(targetContractorId));
+      if (error) throw new Error("Could not mark complete: " + error.message);
+      return { statusCode: 200, body: { success: true } };
+    }
 
     return { statusCode: 400, body: { error: `Unknown action: ${action}` } };
   } catch (err) {
