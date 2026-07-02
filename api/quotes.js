@@ -55,19 +55,23 @@ function rowToQuoteRequest(row, recipients) {
 }
 
 async function createQuoteRequest({ homeownerId, description, budget, timeline, zip, contractorIds }) {
-  // Check for existing open requests to the same contractors from this homeowner
-  // to prevent accidental duplicate submissions
-  const { data: existingRecipients } = await supabase
-    .from("quote_recipients")
-    .select("contractor_id, quote_requests!inner(homeowner_id)")
-    .eq("quote_requests.homeowner_id", toId(homeownerId))
-    .in("contractor_id", contractorIds.map(toId))
-    .in("status", ["sent", "responded"]);
+  // Check for existing open requests from this homeowner to any of the same contractors.
+  // Two-step: first get all this homeowner's open quote request IDs, then check recipients.
+  const { data: openRequests } = await supabase
+    .from("quote_requests")
+    .select("id")
+    .eq("homeowner_id", toId(homeownerId));
 
-  if (existingRecipients && existingRecipients.length > 0) {
-    const duplicateIds = existingRecipients.map((r) => r.contractor_id);
-    const duplicateContractors = contractorIds.filter((id) => duplicateIds.some((d) => String(d) === String(id)));
-    if (duplicateContractors.length > 0) {
+  if (openRequests && openRequests.length > 0) {
+    const openIds = openRequests.map((r) => r.id);
+    const { data: existingRecipients } = await supabase
+      .from("quote_recipients")
+      .select("contractor_id")
+      .in("quote_request_id", openIds)
+      .in("contractor_id", contractorIds.map(toId))
+      .in("status", ["sent", "responded"]);
+
+    if (existingRecipients && existingRecipients.length > 0) {
       throw new Error("You already have an open quote request with one or more of these contractors. Check your existing requests before sending a new one.");
     }
   }
