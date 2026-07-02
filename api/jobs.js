@@ -127,6 +127,17 @@ async function reportJob({ contractorId, quoteRequestId, homeownerId, descriptio
     );
   }
 
+  // Prevent duplicate reports for the same quote request
+  if (quoteRequestId) {
+    const { data: existing } = await supabase
+      .from("completed_jobs")
+      .select("id")
+      .eq("contractor_id", toId(contractorId))
+      .eq("quote_request_id", toId(quoteRequestId))
+      .maybeSingle();
+    if (existing) throw new Error("You have already reported this job.");
+  }
+
   const { data, error } = await supabase
     .from("completed_jobs")
     .insert({
