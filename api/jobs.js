@@ -671,6 +671,13 @@ async function handleJobsRequest(body, req) {
 
     // ── Cron: auto-confirm jobs pending for 7+ days, remind at 3 days ──
     if (action === "cronAutoConfirm") {
+      try {
+        if (!checkAdminPassword(body.adminPassword, req)) {
+          return { statusCode: 401, body: { error: "Unauthorized." } };
+        }
+      } catch (err) {
+        return { statusCode: 429, body: { error: err.message } };
+      }
       const now = new Date();
       const autoConfirmCutoff = new Date(now - 7 * 24 * 60 * 60 * 1000);
       const reminderCutoff = new Date(now - 3 * 24 * 60 * 60 * 1000);
