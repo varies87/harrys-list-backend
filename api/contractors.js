@@ -33,6 +33,7 @@
  */
 
 const { createClient } = require("@supabase/supabase-js");
+const { emailContractorApproved } = require("./email");
 
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SECRET_KEY);
 
@@ -562,6 +563,13 @@ async function handleContractorsRequest(body, req) {
         return { statusCode: 400, body: { error: "status must be 'approved', 'rejected', or 'archived'." } };
       }
       const contractor = await setContractorStatus(body.contractorId, body.status);
+      // Email contractor when approved
+      if (body.status === "approved" && contractor.email) {
+        emailContractorApproved({
+          contractorEmail: contractor.email,
+          contractorName: contractor.businessName,
+        }).catch(() => {});
+      }
       return { statusCode: 200, body: { contractor } };
     }
 
