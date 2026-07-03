@@ -85,19 +85,30 @@ function rowToJob(row) {
 }
 
 async function reportJob({ contractorId, quoteRequestId, homeownerId, description, reportedAmount, lowReportReason, invoiceLineItems, invoiceNote }) {
-  // Look up the original quoted price so we can compare it to what's being reported.
-  // We join quote_recipients on both quote_request_id AND contractor_id so we get
-  // exactly the quote this contractor sent for this job -- not someone else's quote
-  // on the same request.
+  // A contractor can only report a job for a quote request they were
+  // actually sent and responded to -- otherwise anyone with a contractor
+  // account could report a fabricated "completed job" against any homeowner
+  // by guessing a quoteRequestId, forcing that homeowner to see something
+  // needing confirmation for work that never happened. This matches the
+  // app's own UI gate ("Send invoice & mark complete" only shows once the
+  // contractor has responded), not the separate/stricter "homeowner
+  // accepted" flag -- homeowners often hire informally (phone/text) without
+  // ever clicking "Accept" in the app, so requiring that would break a real,
+  // intended flow rather than close an actual gap.
   let quotedAmount = null;
   if (quoteRequestId && contractorId) {
     const { data: quoteRow } = await supabase
       .from("quote_recipients")
-      .select("quote_price")
+      .select("quote_price, status")
       .eq("quote_request_id", toId(quoteRequestId))
       .eq("contractor_id", toId(contractorId))
       .maybeSingle();
-    if (quoteRow) quotedAmount = Number(quoteRow.quote_price);
+    if (!quoteRow || quoteRow.status !== "responded") {
+      throw new Error("You can only report a job for a quote request you've responded to.");
+    }
+    quotedAmount = Number(quoteRow.quote_price);
+  } else {
+    throw new Error("quoteRequestId is required to report a job.");
   }
 
   const low = isLowReport(quotedAmount, Number(reportedAmount));

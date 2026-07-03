@@ -120,6 +120,7 @@ async function emailHomeownerConfirmJob({ homeownerEmail, homeownerName, contrac
       <p><strong>${esc(contractorName)}</strong> reported that the following job is complete:</p>
       <p><strong>${esc(description)}</strong><br/>Reported amount: <strong>$${Number(reportedAmount).toLocaleString()}</strong></p>
       <p>Please log in to confirm the amount is correct — or dispute it if something's off. This triggers their platform fee, not a charge to you.</p>
+      <p style="font-size: 13px; color: #6B5840;">If we don't hear from you within 7 days, it'll be automatically confirmed.</p>
       <a href="${BASE_URL}" class="btn">Confirm or dispute →</a>
     `),
   });
