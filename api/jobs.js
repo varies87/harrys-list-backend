@@ -178,7 +178,35 @@ async function listJobsForContractor(contractorId) {
     .eq("contractor_id", toId(contractorId))
     .order("created_at", { ascending: false });
   if (error) throw new Error("Could not list jobs: " + error.message);
-  return data.map(rowToJob);
+  const jobs = data.map(rowToJob);
+
+  // Enrich with the homeowner's name (from homeowners) and the job address +
+  // phone (from the originating quote request). The contractor legitimately
+  // has this info post-acceptance; it's used to fill the invoice "Bill to".
+  const homeownerIds = [...new Set(jobs.map((j) => j.homeownerId).filter(Boolean))];
+  const quoteRequestIds = [...new Set(jobs.map((j) => j.quoteRequestId).filter(Boolean))];
+
+  const [homeownersRes, qrsRes] = await Promise.all([
+    homeownerIds.length
+      ? supabase.from("homeowners").select("id, name, phone").in("id", homeownerIds)
+      : Promise.resolve({ data: [] }),
+    quoteRequestIds.length
+      ? supabase.from("quote_requests").select("id, address").in("id", quoteRequestIds)
+      : Promise.resolve({ data: [] }),
+  ]);
+
+  const nameById = new Map((homeownersRes.data || []).map((h) => [String(h.id), h]));
+  const addrByQr = new Map((qrsRes.data || []).map((q) => [String(q.id), q.address || null]));
+
+  return jobs.map((j) => {
+    const ho = nameById.get(String(j.homeownerId));
+    return {
+      ...j,
+      homeownerName: ho?.name || null,
+      homeownerPhone: ho?.phone || null,
+      address: addrByQr.get(String(j.quoteRequestId)) || null,
+    };
+  });
 }
 
 async function listJobsForHomeowner(homeownerId) {
