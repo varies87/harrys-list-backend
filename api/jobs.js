@@ -33,6 +33,8 @@
 const { createClient } = require("@supabase/supabase-js");
 const {
   emailHomeownerConfirmJob,
+  emailHomeownerConfirmReminder,
+  emailHomeownerAutoConfirmed,
   emailContractorJobConfirmed,
   emailContractorPaymentOverdue,
 } = require("./email");
@@ -626,6 +628,78 @@ async function handleJobsRequest(body, req) {
       }
       const disputed = await listDisputedJobs();
       return { statusCode: 200, body: { disputed } };
+    }
+
+    // ── Cron: auto-confirm jobs pending for 7+ days, remind at 3 days ──
+    if (action === "cronAutoConfirm") {
+      const now = new Date();
+      const autoConfirmCutoff = new Date(now - 7 * 24 * 60 * 60 * 1000);
+      const reminderCutoff = new Date(now - 3 * 24 * 60 * 60 * 1000);
+
+      // Find all jobs still pending confirmation
+      const { data: pendingJobs } = await supabase
+        .from("completed_jobs")
+        .select("*, homeowners(name, email), contractors(business_name, email)")
+        .eq("status", "pending_confirmation");
+
+      let autoConfirmed = 0;
+      let reminded = 0;
+
+      for (const job of pendingJobs || []) {
+        const reportedAt = new Date(job.created_at);
+        const homeowner = job.homeowners;
+        const contractor = job.contractors;
+
+        if (reportedAt < autoConfirmCutoff) {
+          // Auto-confirm
+          await supabase
+            .from("completed_jobs")
+            .update({ status: "confirmed", confirmed_at: now.toISOString() })
+            .eq("id", job.id);
+
+          // Email homeowner that it was auto-confirmed
+          if (homeowner?.email) {
+            emailHomeownerAutoConfirmed({
+              homeownerEmail: homeowner.email,
+              homeownerName: homeowner.name,
+              contractorName: contractor?.business_name || "Your contractor",
+              reportedAmount: job.reported_amount,
+              description: job.description,
+            }).catch(() => {});
+          }
+
+          // Email contractor that fee is now due
+          if (contractor?.email) {
+            const feeOwed = feeOwedForAmount(Number(job.reported_amount));
+            emailContractorJobConfirmed({
+              contractorEmail: contractor.email,
+              contractorName: contractor.business_name,
+              description: job.description,
+              reportedAmount: job.reported_amount,
+              feeOwed,
+              daysToPayment: PAYMENT_DUE_DAYS,
+            }).catch(() => {});
+          }
+          autoConfirmed++;
+
+        } else if (reportedAt < reminderCutoff) {
+          // Send 3-day reminder to homeowner
+          if (homeowner?.email) {
+            const daysLeft = 7 - Math.floor((now - reportedAt) / (24 * 60 * 60 * 1000));
+            emailHomeownerConfirmReminder({
+              homeownerEmail: homeowner.email,
+              homeownerName: homeowner.name,
+              contractorName: contractor?.business_name || "Your contractor",
+              reportedAmount: job.reported_amount,
+              description: job.description,
+              daysLeft,
+            }).catch(() => {});
+          }
+          reminded++;
+        }
+      }
+
+      return { statusCode: 200, body: { autoConfirmed, reminded } };
     }
 
     if (action === "getMetrics") {
