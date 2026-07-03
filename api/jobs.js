@@ -35,7 +35,9 @@ const {
   emailHomeownerConfirmJob,
   emailHomeownerConfirmReminder,
   emailHomeownerAutoConfirmed,
+  emailHomeownerDisputeUpdated,
   emailContractorJobConfirmed,
+  emailContractorJobDisputed,
   emailContractorPaymentOverdue,
 } = require("./email");
 
@@ -246,7 +248,21 @@ async function disputeJob(jobId, note) {
     .select()
     .single();
   if (error) throw new Error("Could not dispute job: " + error.message);
-  return rowToJob(data);
+
+  const job = rowToJob(data);
+  // Email contractor about the dispute
+  const { data: contractor } = await supabase
+    .from("contractors").select("business_name, email").eq("id", toId(job.contractorId)).maybeSingle();
+  if (contractor?.email) {
+    emailContractorJobDisputed({
+      contractorEmail: contractor.email,
+      contractorName: contractor.business_name,
+      description: job.description,
+      reportedAmount: job.reportedAmount,
+      disputeNote: note || null,
+    }).catch(() => {});
+  }
+  return job;
 }
 
 /**
@@ -360,7 +376,26 @@ async function editReportedAmount(jobId, newAmount, lowReportReason) {
     .select()
     .single();
   if (error) throw new Error("Could not update reported amount: " + error.message);
-  return rowToJob(data);
+  const job = rowToJob(data);
+
+  // If this was a disputed job, email homeowner that amount was updated
+  if (existing.status === "disputed") {
+    const { data: homeowner } = await supabase
+      .from("homeowners").select("name, email").eq("id", toId(job.homeownerId)).maybeSingle();
+    const { data: contractor } = await supabase
+      .from("contractors").select("business_name").eq("id", toId(job.contractorId)).maybeSingle();
+    if (homeowner?.email) {
+      emailHomeownerDisputeUpdated({
+        homeownerEmail: homeowner.email,
+        homeownerName: homeowner.name,
+        contractorName: contractor?.business_name || "Your contractor",
+        newAmount,
+        description: job.description,
+      }).catch(() => {});
+    }
+  }
+
+  return job;
 }
 
 /**
@@ -655,11 +690,18 @@ async function handleJobsRequest(body, req) {
         const contractor = job.contractors;
 
         if (reportedAt < autoConfirmCutoff) {
-          // Auto-confirm
+          // Auto-confirm — also set homeowner_marked_complete so review gate triggers
           await supabase
             .from("completed_jobs")
             .update({ status: "confirmed", confirmed_at: now.toISOString() })
             .eq("id", job.id);
+
+          // Mark the quote recipient so review gate fires on frontend
+          await supabase
+            .from("quote_recipients")
+            .update({ homeowner_marked_complete: true, homeowner_marked_complete_at: now.toISOString() })
+            .eq("quote_request_id", toId(job.quote_request_id))
+            .eq("contractor_id", toId(job.contractor_id));
 
           // Email homeowner that it was auto-confirmed
           if (homeowner?.email) {
