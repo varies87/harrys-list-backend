@@ -103,6 +103,8 @@ function rowToJob(row) {
     quotedAmount: row.quoted_amount != null ? Number(row.quoted_amount) : null,
     isLowReport: !!row.is_low_report,
     lowReportReason: row.low_report_reason || undefined,
+    invoiceLineItems: row.invoice_line_items || null,
+    invoiceNote: row.invoice_note || null,
     status: row.status,
     reportedAt: row.created_at,
     confirmedAt: row.confirmed_at || undefined,
@@ -112,7 +114,7 @@ function rowToJob(row) {
   };
 }
 
-async function reportJob({ contractorId, quoteRequestId, homeownerId, description, reportedAmount, lowReportReason }) {
+async function reportJob({ contractorId, quoteRequestId, homeownerId, description, reportedAmount, lowReportReason, invoiceLineItems, invoiceNote }) {
   // Look up the original quoted price so we can compare it to what's being reported.
   // We join quote_recipients on both quote_request_id AND contractor_id so we get
   // exactly the quote this contractor sent for this job -- not someone else's quote
@@ -159,6 +161,8 @@ async function reportJob({ contractorId, quoteRequestId, homeownerId, descriptio
       quoted_amount: quotedAmount,
       is_low_report: low,
       low_report_reason: low ? lowReportReason : null,
+      invoice_line_items: invoiceLineItems || null,
+      invoice_note: invoiceNote || null,
       status: "pending_confirmation",
       fee_paid: false,
     })
@@ -753,7 +757,7 @@ async function handleJobsRequest(body, req) {
       if (!derivedHomeownerId) {
         return { statusCode: 400, body: { error: "Could not determine homeowner for this job. Make sure quoteRequestId is provided." } };
       }
-      const job = await reportJob({ contractorId, quoteRequestId, homeownerId: derivedHomeownerId, description, reportedAmount, lowReportReason });
+      const job = await reportJob({ contractorId, quoteRequestId, homeownerId: derivedHomeownerId, description, reportedAmount, lowReportReason, invoiceLineItems: body.invoiceLineItems || null, invoiceNote: body.invoiceNote || null });
       return { statusCode: 200, body: { job } };
     }
 
