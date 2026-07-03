@@ -42,7 +42,11 @@ function rowToRecipient(row) {
     homeownerMarkedComplete: !!row.homeowner_marked_complete,
     quote:
       row.quote_price != null
-        ? { price: Number(row.quote_price), message: row.quote_message || "" }
+        ? {
+            price: Number(row.quote_price),
+            message: row.quote_message || "",
+            lineItems: row.quote_line_items || null,
+          }
         : undefined,
   };
 }
@@ -169,7 +173,7 @@ async function attachRecipients(requests) {
   );
 }
 
-async function respondToQuote(quoteRequestId, contractorId, status, price, message) {
+async function respondToQuote(quoteRequestId, contractorId, status, price, message, lineItems) {
   // Only allow responding if currently in 'sent' status
   // Prevents un-declining or overwriting an existing quote
   const { data: existing } = await supabase
@@ -188,6 +192,9 @@ async function respondToQuote(quoteRequestId, contractorId, status, price, messa
   if (status === "responded") {
     updates.quote_price = price;
     updates.quote_message = message || "";
+    if (lineItems && lineItems.length > 0) {
+      updates.quote_line_items = lineItems;
+    }
   }
 
   const { error } = await supabase
@@ -389,7 +396,7 @@ async function handleQuotesRequest(body, req) {
         return { statusCode: 400, body: { error: "quoteRequestId and status are required." } };
       }
       // contractorId comes from the verified session.
-      const result = await respondToQuote(quoteRequestId, contractorId, status, price, message);
+      const result = await respondToQuote(quoteRequestId, contractorId, status, price, message, body.lineItems || null);
       return { statusCode: 200, body: result };
     }
 
