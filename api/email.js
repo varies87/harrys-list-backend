@@ -281,6 +281,26 @@ async function emailHomeownerDisputeUpdated({ homeownerEmail, homeownerName, con
   });
 }
 
+/** Homeowner accepted contractor's quote */
+async function emailContractorQuoteAccepted({ contractorEmail, contractorName, homeownerName, homeownerPhone, address, description, price }) {
+  await sendEmail({
+    to: contractorEmail,
+    subject: `${homeownerName} accepted your quote — Harry's List`,
+    html: baseTemplate(`
+      <p>Hi ${contractorName},</p>
+      <p>Great news — <strong>${homeownerName}</strong> accepted your quote of <strong>$${Number(price).toLocaleString()}</strong> for:</p>
+      <p><strong>${description}</strong></p>
+      <p>Here is their contact information:</p>
+      <div style="background:#F2EDE6;border-radius:8px;padding:14px 18px;margin:16px 0;">
+        ${address ? `<p style="margin:0 0 6px;font-size:14px;color:#1C2B22;">📍 <strong>${address}</strong></p>` : ""}
+        ${homeownerPhone ? `<p style="margin:0;font-size:14px;color:#1C2B22;">📞 <strong>${homeownerPhone}</strong></p>` : ""}
+      </div>
+      <p>Reach out to coordinate timing and complete the job. Once done, submit your invoice through Harry's List.</p>
+      <a href="${BASE_URL}/contractors" class="btn">Go to your portal →</a>
+    `),
+  });
+}
+
 module.exports = {
   emailHomeownerQuoteReceived,
   emailHomeownerConfirmJob,
@@ -294,4 +314,5 @@ module.exports = {
   emailContractorPaymentOverdue,
   emailContractorMarkComplete,
   emailContractorApproved,
+  emailContractorQuoteAccepted,
 };
