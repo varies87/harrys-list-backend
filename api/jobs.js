@@ -31,6 +31,11 @@
  */
 
 const { createClient } = require("@supabase/supabase-js");
+const {
+  emailHomeownerConfirmJob,
+  emailContractorJobConfirmed,
+  emailContractorPaymentOverdue,
+} = require("./email");
 
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SECRET_KEY);
 
@@ -158,6 +163,24 @@ async function reportJob({ contractorId, quoteRequestId, homeownerId, descriptio
     .select()
     .single();
   if (error) throw new Error("Could not report job: " + error.message);
+
+  // Email homeowner to confirm the job amount
+  if (homeownerId) {
+    const { data: homeowner } = await supabase
+      .from("homeowners").select("name, email").eq("id", toId(homeownerId)).maybeSingle();
+    const { data: contractor } = await supabase
+      .from("contractors").select("business_name").eq("id", toId(contractorId)).maybeSingle();
+    if (homeowner?.email) {
+      emailHomeownerConfirmJob({
+        homeownerEmail: homeowner.email,
+        homeownerName: homeowner.name,
+        contractorName: contractor?.business_name || "Your contractor",
+        reportedAmount,
+        description,
+      }).catch(() => {});
+    }
+  }
+
   return rowToJob(data);
 }
 
@@ -189,7 +212,24 @@ async function confirmJob(jobId) {
     .select()
     .single();
   if (error) throw new Error("Could not confirm job: " + error.message);
-  return rowToJob(data);
+
+  // Email contractor that fee is now due
+  const job = rowToJob(data);
+  const { data: contractor } = await supabase
+    .from("contractors").select("business_name, email").eq("id", toId(job.contractorId)).maybeSingle();
+  if (contractor?.email) {
+    const feeOwed = feeOwedForAmount(job.reportedAmount);
+    emailContractorJobConfirmed({
+      contractorEmail: contractor.email,
+      contractorName: contractor.business_name,
+      description: job.description,
+      reportedAmount: job.reportedAmount,
+      feeOwed,
+      daysToPayment: PAYMENT_DUE_DAYS,
+    }).catch(() => {});
+  }
+
+  return job;
 }
 
 async function disputeJob(jobId, note) {
