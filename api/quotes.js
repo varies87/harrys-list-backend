@@ -161,9 +161,9 @@ async function listQuoteRequestsForContractor(contractorId) {
 
   const result = await attachRecipients(requests);
 
-  // For confirmed jobs (homeowner_marked_complete), fetch homeowner phone
+  // For confirmed jobs OR accepted quotes, fetch homeowner phone
   const confirmedRequests = result.filter((qr) =>
-    qr.recipients.some((r) => r.contractorId === contractorId && r.homeownerMarkedComplete)
+    qr.recipients.some((r) => r.contractorId === contractorId && (r.homeownerMarkedComplete || r.homeownerAccepted))
   );
   if (confirmedRequests.length > 0) {
     const homeownerIds = [...new Set(confirmedRequests.map((qr) => qr.homeownerId).filter(Boolean))];
