@@ -145,18 +145,71 @@ function timingSafeEqualStr(a, b) {
   return crypto.timingSafeEqual(ha, hb);
 }
 
+/**
+ * Checks whether `key` is currently within its limit WITHOUT recording a new
+ * attempt. Used so that checking "am I locked out?" never itself counts as
+ * an attempt.
+ */
+async function rateLimitPeek(key, { max, windowMs }) {
+  const now = Date.now();
+  try {
+    const windowStart = new Date(now - windowMs).toISOString();
+    const { count, error } = await supabase
+      .from("rate_limits")
+      .select("id", { count: "exact", head: true })
+      .eq("bucket", key)
+      .gte("created_at", windowStart);
+    if (error) throw error;
+    return (count || 0) < max;
+  } catch (_) {
+    const rec = _memBuckets.get(key) || { hits: [] };
+    rec.hits = rec.hits.filter((t) => t > now - windowMs);
+    return rec.hits.length < max;
+  }
+}
+
+/** Records one attempt against `key`, independent of rateLimit()'s combined check-and-record. */
+async function rateLimitRecord(key, windowMs) {
+  const now = Date.now();
+  try {
+    await supabase.from("rate_limits").insert({ bucket: key });
+  } catch (_) {
+    const rec = _memBuckets.get(key) || { hits: [] };
+    rec.hits = rec.hits.filter((t) => t > now - windowMs);
+    rec.hits.push(now);
+    _memBuckets.set(key, rec);
+  }
+}
+
+// Admin lockout window and threshold, in one place so they're easy to tune.
+const ADMIN_LOCKOUT_MAX_FAILURES = 8;
+const ADMIN_LOCKOUT_WINDOW_MS = 30 * 60 * 1000; // 30 minutes
+
 async function checkAdminPassword(password, req) {
   const ip = clientIp(req);
-  const allowed = await rateLimit(`admin:${ip}`, { max: 5, windowMs: 60 * 60 * 1000 });
-  if (!allowed) {
+  const key = `admin:${ip}`;
+  const windowOpts = { max: ADMIN_LOCKOUT_MAX_FAILURES, windowMs: ADMIN_LOCKOUT_WINDOW_MS };
+
+  // Peek only -- the admin panel resends the password on every action
+  // (approving a contractor, switching tabs, etc.), so checking "am I
+  // locked out" must never itself count as an attempt. Only an actual
+  // WRONG password below adds to the count.
+  const stillAllowed = await rateLimitPeek(key, windowOpts);
+  if (!stillAllowed) {
     throw new Error("Too many failed attempts. Please try again later.");
   }
+
   const realPassword = process.env.ADMIN_PASSWORD;
   if (!realPassword) {
     console.error("WARNING: ADMIN_PASSWORD is not set. Admin actions are disabled.");
     return false;
   }
-  return timingSafeEqualStr(password || "", realPassword);
+
+  const isCorrect = timingSafeEqualStr(password || "", realPassword);
+  if (!isCorrect) {
+    await rateLimitRecord(key, ADMIN_LOCKOUT_WINDOW_MS);
+  }
+  return isCorrect;
 }
 
 // ---------------------------------------------------------------------------
