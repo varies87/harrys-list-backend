@@ -501,6 +501,23 @@ async function handleContractorsRequest(body, req) {
       return { statusCode: 200, body: { photos } };
     }
 
+    if (action === "listArchived") {
+      try {
+        if (!checkAdminPassword(body.adminPassword, req)) {
+          return { statusCode: 401, body: { error: "Incorrect admin password." } };
+        }
+      } catch (err) {
+        return { statusCode: 429, body: { error: err.message } };
+      }
+      const { data, error } = await supabase
+        .from("contractors")
+        .select("*")
+        .eq("status", "archived")
+        .order("created_at", { ascending: false });
+      if (error) throw new Error(error.message);
+      return { statusCode: 200, body: { contractors: (data || []).map((r) => rowToContractor(r)) } };
+    }
+
     if (action === "listPending") {
       try {
         if (!checkAdminPassword(body.adminPassword, req)) {
@@ -524,8 +541,8 @@ async function handleContractorsRequest(body, req) {
       if (!body.contractorId || !body.status) {
         return { statusCode: 400, body: { error: "contractorId and status are required." } };
       }
-      if (body.status !== "approved" && body.status !== "rejected") {
-        return { statusCode: 400, body: { error: "status must be 'approved' or 'rejected'." } };
+      if (body.status !== "approved" && body.status !== "rejected" && body.status !== "archived") {
+        return { statusCode: 400, body: { error: "status must be 'approved', 'rejected', or 'archived'." } };
       }
       const contractor = await setContractorStatus(body.contractorId, body.status);
       return { statusCode: 200, body: { contractor } };
