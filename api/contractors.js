@@ -501,6 +501,23 @@ async function handleContractorsRequest(body, req) {
       return { statusCode: 200, body: { photos } };
     }
 
+    if (action === "listApproved") {
+      try {
+        if (!checkAdminPassword(body.adminPassword, req)) {
+          return { statusCode: 401, body: { error: "Incorrect admin password." } };
+        }
+      } catch (err) {
+        return { statusCode: 429, body: { error: err.message } };
+      }
+      const { data, error } = await supabase
+        .from("contractors")
+        .select("*")
+        .eq("status", "approved")
+        .order("created_at", { ascending: false });
+      if (error) throw new Error(error.message);
+      return { statusCode: 200, body: { contractors: (data || []).map((r) => rowToContractor(r)) } };
+    }
+
     if (action === "listArchived") {
       try {
         if (!checkAdminPassword(body.adminPassword, req)) {
