@@ -492,7 +492,7 @@ async function getMetrics() {
     { data: recentContractors },
   ] = await Promise.all([
     supabase.from("contractors").select("*", { count: "exact", head: true }).eq("status", "approved"),
-    supabase.from("contractors").select("*", { count: "exact", head: true }).eq("status", "pending"),
+    supabase.from("contractors").select("*", { count: "exact", head: true }).in("status", ["pending", "pending_review"]),
     supabase.from("contractors").select("*", { count: "exact", head: true }).eq("is_suspended", true),
     supabase.from("homeowners").select("*", { count: "exact", head: true }),
     supabase.from("quote_requests").select("*", { count: "exact", head: true }),

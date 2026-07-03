@@ -101,7 +101,7 @@ async function listContractors() {
   const { data, error } = await supabase
     .from("contractors")
     .select("*")
-    .eq("status", "approved")
+    .in("status", ["approved", "pending_review"])
     .eq("is_suspended", false)
     .order("created_at", { ascending: false });
   if (error) throw new Error("Could not list contractors: " + error.message);
@@ -128,7 +128,7 @@ async function listPendingContractors() {
   const { data, error } = await supabase
     .from("contractors")
     .select("*")
-    .eq("status", "pending")
+    .in("status", ["pending", "pending_review"])
     .order("created_at", { ascending: false });
   if (error) throw new Error("Could not list pending contractors: " + error.message);
   return data.map((row) => rowToContractor(row));
@@ -190,12 +190,31 @@ const CONTRACTOR_EDITABLE_FIELDS = [
   "logoUrl",
 ];
 
+// Fields that, if edited AFTER a contractor is already approved, put the
+// listing back into the admin queue for a quick re-review -- these are the
+// free-text fields most worth a second look (business name, bio, license
+// claims). Portfolio photos and service area don't trigger this.
+const SENSITIVE_EDIT_FIELDS = ["businessName", "bio", "licenseInfo"];
+
 async function updateMyContractor(authUserId, updates) {
   const safeUpdates = {};
   for (const key of CONTRACTOR_EDITABLE_FIELDS) {
     if (updates[key] !== undefined) safeUpdates[key] = updates[key];
   }
   const row = contractorToRow(safeUpdates);
+
+  const touchesSensitiveField = SENSITIVE_EDIT_FIELDS.some((key) => updates[key] !== undefined);
+  if (touchesSensitiveField) {
+    const { data: existing } = await supabase
+      .from("contractors").select("status").eq("auth_user_id", authUserId).maybeSingle();
+    // Only a currently-approved listing gets bumped back to re-review --
+    // a contractor still in the normal "pending" (first-time) queue, or
+    // already in "pending_review", just stays where they are.
+    if (existing?.status === "approved") {
+      row.status = "pending_review";
+    }
+  }
+
   // Deliberately do NOT regenerate slug on business name change --
   // the slug is set once at creation and never changes so existing
   // shared links and QR codes keep working.
@@ -394,8 +413,11 @@ async function getContractorWithReviews(contractorId) {
     .single();
   if (rowError) throw new Error("Could not find contractor: " + rowError.message);
 
-  // Don't expose suspended or unapproved contractors on public profiles
-  if (row.status !== "approved" || row.is_suspended) {
+  // Don't expose suspended or unapproved contractors on public profiles.
+  // pending_review is included here too -- it's an already-approved listing
+  // with a sensitive-field edit awaiting a quick admin look, and it stays
+  // live in the meantime (see updateMyContractor).
+  if ((row.status !== "approved" && row.status !== "pending_review") || row.is_suspended) {
     throw new Error("This contractor profile is not publicly available.");
   }
 
