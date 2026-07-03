@@ -238,6 +238,11 @@ async function updateMyContractor(authUserId, updates) {
 }
 
 async function setContractorStatus(contractorId, status) {
+  // Fetch previous status so we can detect first-time approval
+  const { data: existing } = await supabase
+    .from("contractors").select("status").eq("id", toId(contractorId)).maybeSingle();
+  const previousStatus = existing?.status;
+
   const { data, error } = await supabase
     .from("contractors")
     .update({ status })
@@ -245,7 +250,9 @@ async function setContractorStatus(contractorId, status) {
     .select()
     .single();
   if (error) throw new Error("Could not update contractor status: " + error.message);
-  return rowToContractor(data);
+  const contractor = rowToContractor(data);
+  contractor._previousStatus = previousStatus; // Pass through for email logic
+  return contractor;
 }
 
 const MAX_PORTFOLIO_PHOTOS = 20;
@@ -563,8 +570,8 @@ async function handleContractorsRequest(body, req) {
         return { statusCode: 400, body: { error: "status must be 'approved', 'rejected', or 'archived'." } };
       }
       const contractor = await setContractorStatus(body.contractorId, body.status);
-      // Email contractor when approved
-      if (body.status === "approved" && contractor.email) {
+      // Email contractor on first approval only (not re-approval)
+      if (body.status === "approved" && contractor._previousStatus !== "approved" && contractor.email) {
         emailContractorApproved({
           contractorEmail: contractor.email,
           contractorName: contractor.businessName,
