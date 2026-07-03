@@ -24,6 +24,7 @@ const {
   emailHomeownerEstimateRequest,
   emailContractorNewQuote,
   emailContractorMarkComplete,
+  emailContractorQuoteAccepted,
 } = require("./email");
 
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SECRET_KEY);
@@ -40,6 +41,7 @@ function rowToRecipient(row) {
     status: row.status,
     jobReported: !!row.job_reported,
     homeownerMarkedComplete: !!row.homeowner_marked_complete,
+    homeownerAccepted: !!row.homeowner_accepted,
     quote:
       row.quote_price != null
         ? {
@@ -449,6 +451,62 @@ async function handleQuotesRequest(body, req) {
       }
       const photo = await uploadQuotePhoto(homeownerId, quoteRequestId, fileBase64, fileName, contentType || "image/jpeg", thumbnailBase64 || null);
       return { statusCode: 200, body: { photo } };
+    }
+
+    if (action === "acceptQuote") {
+      if (!homeownerId) return { statusCode: 403, body: { error: "No homeowner profile found." } };
+      const { quoteRequestId, contractorId: targetContractorId } = body;
+      if (!quoteRequestId || !targetContractorId) {
+        return { statusCode: 400, body: { error: "quoteRequestId and contractorId are required." } };
+      }
+      // Verify quote request belongs to this homeowner
+      const { data: qr } = await supabase
+        .from("quote_requests")
+        .select("homeowner_id, description, address")
+        .eq("id", toId(quoteRequestId))
+        .maybeSingle();
+      if (!qr || String(qr.homeowner_id) !== String(homeownerId)) {
+        return { statusCode: 403, body: { error: "Not authorized." } };
+      }
+      // Verify recipient has responded with a quote
+      const { data: recipient } = await supabase
+        .from("quote_recipients")
+        .select("status, quote_price, homeowner_accepted")
+        .eq("quote_request_id", toId(quoteRequestId))
+        .eq("contractor_id", toId(targetContractorId))
+        .maybeSingle();
+      if (!recipient) return { statusCode: 404, body: { error: "Recipient not found." } };
+      if (recipient.status !== "responded") {
+        return { statusCode: 400, body: { error: "Can only accept a quote after the contractor has responded." } };
+      }
+      if (recipient.homeowner_accepted) {
+        return { statusCode: 400, body: { error: "You have already accepted this quote." } };
+      }
+      // Mark as accepted
+      const { error } = await supabase
+        .from("quote_recipients")
+        .update({ homeowner_accepted: true, homeowner_accepted_at: new Date().toISOString() })
+        .eq("quote_request_id", toId(quoteRequestId))
+        .eq("contractor_id", toId(targetContractorId));
+      if (error) throw new Error("Could not accept quote: " + error.message);
+
+      // Reveal address + phone to contractor via email
+      const { data: contractor } = await supabase
+        .from("contractors").select("business_name, email").eq("id", toId(targetContractorId)).maybeSingle();
+      const { data: homeowner } = await supabase
+        .from("homeowners").select("name, phone").eq("id", toId(homeownerId)).maybeSingle();
+      if (contractor?.email) {
+        emailContractorQuoteAccepted({
+          contractorEmail: contractor.email,
+          contractorName: contractor.business_name,
+          homeownerName: homeowner?.name || "The homeowner",
+          homeownerPhone: homeowner?.phone || null,
+          address: qr.address || null,
+          description: qr.description,
+          price: recipient.quote_price,
+        }).catch(() => {});
+      }
+      return { statusCode: 200, body: { success: true } };
     }
 
     if (action === "markComplete") {
