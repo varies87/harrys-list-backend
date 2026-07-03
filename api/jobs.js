@@ -30,7 +30,6 @@
  * ---------------------------------------------------------------------------
  */
 
-const { createClient } = require("@supabase/supabase-js");
 const {
   emailHomeownerConfirmJob,
   emailHomeownerConfirmReminder,
@@ -40,47 +39,16 @@ const {
   emailContractorJobDisputed,
   emailContractorPaymentOverdue,
 } = require("./email");
+// feeOwedForAmount lives in create-payment-intent.js; it was previously
+// referenced here without being imported, which threw a ReferenceError and
+// 500'd job confirmation (H-1).
+const { feeOwedForAmount } = require("./create-payment-intent");
+const { supabase, toId, getAuthedUser, setCors, checkAdminPassword } = require("./_shared");
 
-const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SECRET_KEY);
-
-const adminAttempts = new Map();
-const MAX_ADMIN_ATTEMPTS = 5;
-const ADMIN_LOCKOUT_MS = 60 * 60 * 1000;
-
-function checkAdminPassword(password, req) {
-  const ip = (req && (req.headers["x-forwarded-for"] || req.socket?.remoteAddress)) || "unknown";
-  const now = Date.now();
-  const record = adminAttempts.get(ip);
-
-  if (record && record.count >= MAX_ADMIN_ATTEMPTS && now < record.resetAt) {
-    const minutesLeft = Math.ceil((record.resetAt - now) / 60000);
-    throw new Error(`Too many failed attempts. Try again in ${minutesLeft} minute${minutesLeft === 1 ? "" : "s"}.`);
-  }
-
-  if (record && now >= record.resetAt) adminAttempts.delete(ip);
-
-  const realPassword = process.env.ADMIN_PASSWORD;
-  if (!realPassword) {
-    console.error("WARNING: ADMIN_PASSWORD environment variable is not set. Admin panel will be inaccessible.");
-    return false;
-  }
-
-  if (password === realPassword) {
-    adminAttempts.delete(ip);
-    return true;
-  }
-
-  const current = adminAttempts.get(ip) || { count: 0, resetAt: now + ADMIN_LOCKOUT_MS };
-  adminAttempts.set(ip, { count: current.count + 1, resetAt: current.resetAt });
-  return false;
-}
-
-
-function toId(value) {
-  if (value === null || value === undefined || value === "") return value;
-  const n = Number(value);
-  return Number.isNaN(n) ? value : n;
-}
+// Days a contractor has to pay the platform fee after a job is confirmed.
+// (Mirrors PAYMENT_DUE_DAYS in the frontend shared.js.) Previously undefined
+// here, contributing to the H-1 confirmation crash.
+const PAYMENT_DUE_DAYS = 10;
 
 /**
  * A report counts as "low" if the reported amount is more than 10% below
@@ -221,20 +189,26 @@ async function confirmJob(jobId) {
     .single();
   if (error) throw new Error("Could not confirm job: " + error.message);
 
-  // Email contractor that fee is now due
   const job = rowToJob(data);
-  const { data: contractor } = await supabase
-    .from("contractors").select("business_name, email").eq("id", toId(job.contractorId)).maybeSingle();
-  if (contractor?.email) {
-    const feeOwed = feeOwedForAmount(job.reportedAmount);
-    emailContractorJobConfirmed({
-      contractorEmail: contractor.email,
-      contractorName: contractor.business_name,
-      description: job.description,
-      reportedAmount: job.reportedAmount,
-      feeOwed,
-      daysToPayment: PAYMENT_DUE_DAYS,
-    }).catch(() => {});
+
+  // Notify the contractor that their fee is now due. Any failure here must NOT
+  // fail the confirmation itself -- the job is already confirmed above.
+  try {
+    const { data: contractor } = await supabase
+      .from("contractors").select("business_name, email").eq("id", toId(job.contractorId)).maybeSingle();
+    if (contractor?.email) {
+      const feeOwed = feeOwedForAmount(job.reportedAmount);
+      emailContractorJobConfirmed({
+        contractorEmail: contractor.email,
+        contractorName: contractor.business_name,
+        description: job.description,
+        reportedAmount: job.reportedAmount,
+        feeOwed,
+        daysToPayment: PAYMENT_DUE_DAYS,
+      }).catch(() => {});
+    }
+  } catch (notifyErr) {
+    console.error("confirmJob: fee-due notification failed (job still confirmed):", notifyErr);
   }
 
   return job;
@@ -599,19 +573,6 @@ async function setAdminReviewStatus(contractorId, status) {
 }
 
 /**
- * Verifies the Authorization header against Supabase Auth.
- * Returns { id, email } for the authenticated user, or null if no valid session.
- */
-async function getAuthedUser(req) {
-  const authHeader = req.headers["authorization"] || req.headers["Authorization"];
-  if (!authHeader || !authHeader.startsWith("Bearer ")) return null;
-  const token = authHeader.slice("Bearer ".length);
-  const { data, error } = await supabase.auth.getUser(token);
-  if (error || !data?.user) return null;
-  return { id: data.user.id, email: data.user.email };
-}
-
-/**
  * Given a verified Supabase auth user id, returns the matching homeowner
  * and contractor profile ids (if they exist). Used to scope job actions to
  * "my own jobs" without trusting any id the client sends in the body.
@@ -634,7 +595,7 @@ async function handleJobsRequest(body, req) {
     // Admin-only actions -- gated by ADMIN_PASSWORD, no session needed.
     if (action === "listLowReportContractors") {
       try {
-        if (!checkAdminPassword(body.adminPassword, req)) {
+        if (!(await checkAdminPassword(body.adminPassword, req))) {
           return { statusCode: 401, body: { error: "Incorrect admin password." } };
         }
       } catch (err) {
@@ -646,7 +607,7 @@ async function handleJobsRequest(body, req) {
 
     if (action === "setAdminReviewStatus") {
       try {
-        if (!checkAdminPassword(body.adminPassword, req)) {
+        if (!(await checkAdminPassword(body.adminPassword, req))) {
           return { statusCode: 401, body: { error: "Incorrect admin password." } };
         }
       } catch (err) {
@@ -659,7 +620,7 @@ async function handleJobsRequest(body, req) {
 
     if (action === "listDisputedJobs") {
       try {
-        if (!checkAdminPassword(body.adminPassword, req)) {
+        if (!(await checkAdminPassword(body.adminPassword, req))) {
           return { statusCode: 401, body: { error: "Incorrect admin password." } };
         }
       } catch (err) {
@@ -672,7 +633,7 @@ async function handleJobsRequest(body, req) {
     // ── Cron: auto-confirm jobs pending for 7+ days, remind at 3 days ──
     if (action === "cronAutoConfirm") {
       try {
-        if (!checkAdminPassword(body.adminPassword, req)) {
+        if (!(await checkAdminPassword(body.adminPassword, req))) {
           return { statusCode: 401, body: { error: "Unauthorized." } };
         }
       } catch (err) {
@@ -757,7 +718,7 @@ async function handleJobsRequest(body, req) {
 
     if (action === "getMetrics") {
       try {
-        if (!checkAdminPassword(body.adminPassword, req)) {
+        if (!(await checkAdminPassword(body.adminPassword, req))) {
           return { statusCode: 401, body: { error: "Incorrect admin password." } };
         }
       } catch (err) {
@@ -769,7 +730,7 @@ async function handleJobsRequest(body, req) {
 
     if (action === "listUnreportedCompletions") {
       try {
-        if (!checkAdminPassword(body.adminPassword, req)) {
+        if (!(await checkAdminPassword(body.adminPassword, req))) {
           return { statusCode: 401, body: { error: "Incorrect admin password." } };
         }
       } catch (err) {
@@ -873,9 +834,7 @@ async function handleJobsRequest(body, req) {
 }
 
 module.exports = async function handler(req, res) {
-  res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+  setCors(req, res);
 
   if (req.method === "OPTIONS") {
     res.status(200).end();

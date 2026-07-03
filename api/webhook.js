@@ -43,19 +43,11 @@
  */
 
 const Stripe = require("stripe");
-const { createClient } = require("@supabase/supabase-js");
+const { supabase, toId } = require("./_shared");
 
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY, {
   apiVersion: "2024-06-20",
 });
-
-const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SECRET_KEY);
-
-function toId(value) {
-  if (value === null || value === undefined || value === "") return value;
-  const n = Number(value);
-  return Number.isNaN(n) ? value : n;
-}
 
 /**
  * Marks a job's fee as paid in Supabase. Mirrors markJobPaid in jobs.js --
@@ -110,13 +102,12 @@ async function markJobPaidFromWebhook(jobId) {
 // the EXACT bytes Stripe sent, and JSON.parse + re-stringify doesn't
 // reliably reproduce those exact bytes). This config block disables that
 // default parsing for this one file only.
-module.exports.config = {
-  api: {
-    bodyParser: false,
-  },
-};
+// NOTE: the `config` export (bodyParser: false) is set AFTER the handler
+// assignment at the bottom of this file. Setting it here would be silently
+// discarded, because `module.exports = handler` below replaces the entire
+// exports object -- that was bug H-2, which broke Stripe signature verification.
 
-/** Reads the raw request body as a Buffer -- needed since bodyParser is off above. */
+/** Reads the raw request body as a Buffer -- needed since bodyParser is off. */
 function readRawBody(req) {
   return new Promise((resolve, reject) => {
     const chunks = [];
@@ -182,3 +173,13 @@ module.exports = async function handler(req, res) {
 
 // Exported for testing.
 module.exports.markJobPaidFromWebhook = markJobPaidFromWebhook;
+
+// IMPORTANT: this MUST come after `module.exports = handler` above. Assigning
+// module.exports to the handler replaces the whole exports object, so setting
+// `.config` before that (as the original code did) silently dropped it and left
+// Stripe's raw-body signature verification broken (H-2).
+module.exports.config = {
+  api: {
+    bodyParser: false,
+  },
+};

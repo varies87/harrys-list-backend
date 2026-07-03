@@ -18,7 +18,6 @@
  * ---------------------------------------------------------------------------
  */
 
-const { createClient } = require("@supabase/supabase-js");
 const {
   emailHomeownerQuoteReceived,
   emailHomeownerEstimateRequest,
@@ -26,14 +25,15 @@ const {
   emailContractorMarkComplete,
   emailContractorQuoteAccepted,
 } = require("./email");
-
-const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SECRET_KEY);
-
-function toId(value) {
-  if (value === null || value === undefined || value === "") return value;
-  const n = Number(value);
-  return Number.isNaN(n) ? value : n;
-}
+const {
+  supabase,
+  toId,
+  getAuthedUser,
+  setCors,
+  rateLimit,
+  clientIp,
+  validateImageUpload,
+} = require("./_shared");
 
 function rowToRecipient(row) {
   return {
@@ -309,27 +309,36 @@ async function uploadQuotePhoto(homeownerId, quoteRequestId, fileBase64, fileNam
     throw new Error(`Maximum ${MAX_QUOTE_PHOTOS} photos per quote request.`);
   }
 
+  // Validate the upload by its actual bytes (PNG/JPEG/WebP only) and use a
+  // sanitized filename. Rejects SVG/HTML and content-type confusion (M-1).
+  const { buffer, contentType: safeType, safeName } = validateImageUpload(fileBase64, fileName);
   const ts = Date.now();
-  const buffer = Buffer.from(fileBase64, "base64");
-  const path = `quote-requests/${quoteRequestId}/${ts}-${fileName}`;
+  const path = `quote-requests/${quoteRequestId}/${ts}-${safeName}`;
 
   const { error: uploadError } = await supabase.storage
     .from("portfolio-photos")
-    .upload(path, buffer, { contentType, upsert: false });
+    .upload(path, buffer, { contentType: safeType, upsert: false });
   if (uploadError) throw new Error("Could not upload photo: " + uploadError.message);
 
   const { data: urlData } = supabase.storage.from("portfolio-photos").getPublicUrl(path);
 
   let thumbnailUrl = null;
   if (thumbnailBase64) {
-    const thumbBuffer = Buffer.from(thumbnailBase64, "base64");
-    const thumbPath = `quote-requests/${quoteRequestId}/${ts}-thumb-${fileName}`;
-    const { error: thumbError } = await supabase.storage
-      .from("portfolio-photos")
-      .upload(thumbPath, thumbBuffer, { contentType: "image/jpeg", upsert: false });
-    if (!thumbError) {
-      const { data: thumbUrlData } = supabase.storage.from("portfolio-photos").getPublicUrl(thumbPath);
-      thumbnailUrl = thumbUrlData.publicUrl;
+    try {
+      const { buffer: thumbBuffer, contentType: thumbType } = validateImageUpload(
+        thumbnailBase64,
+        `thumb-${safeName}`
+      );
+      const thumbPath = `quote-requests/${quoteRequestId}/${ts}-thumb-${safeName}`;
+      const { error: thumbError } = await supabase.storage
+        .from("portfolio-photos")
+        .upload(thumbPath, thumbBuffer, { contentType: thumbType, upsert: false });
+      if (!thumbError) {
+        const { data: thumbUrlData } = supabase.storage.from("portfolio-photos").getPublicUrl(thumbPath);
+        thumbnailUrl = thumbUrlData.publicUrl;
+      }
+    } catch (_) {
+      /* invalid thumbnail -- skip it, keep the main photo */
     }
   }
 
@@ -359,15 +368,6 @@ async function listQuotePhotos(quoteRequestId) {
 
 
 
-async function getAuthedUser(req) {
-  const authHeader = req.headers["authorization"] || req.headers["Authorization"];
-  if (!authHeader || !authHeader.startsWith("Bearer ")) return null;
-  const token = authHeader.slice("Bearer ".length);
-  const { data, error } = await supabase.auth.getUser(token);
-  if (error || !data?.user) return null;
-  return { id: data.user.id, email: data.user.email };
-}
-
 async function getProfileIds(authUserId) {
   const [homeownerRes, contractorRes] = await Promise.allSettled([
     supabase.from("homeowners").select("id").eq("auth_user_id", authUserId).maybeSingle(),
@@ -395,6 +395,15 @@ async function handleQuotesRequest(body, req) {
       const { description, contractorIds } = body;
       if (!description || !contractorIds || contractorIds.length === 0) {
         return { statusCode: 400, body: { error: "description and at least one contractorId are required." } };
+      }
+      if (String(description).length > 5000) {
+        return { statusCode: 400, body: { error: "Description must be 5000 characters or less." } };
+      }
+      if (contractorIds.length > 50) {
+        return { statusCode: 400, body: { error: "Too many contractors selected." } };
+      }
+      if (!(await rateLimit(`quote-create:${clientIp(req)}`, { max: 20, windowMs: 60 * 60 * 1000 }))) {
+        return { statusCode: 429, body: { error: "Too many requests. Please try again later." } };
       }
       // homeownerId comes from the verified session, not the request body.
       const quoteRequest = await createQuoteRequest({ ...body, homeownerId });
@@ -559,9 +568,7 @@ async function handleQuotesRequest(body, req) {
 }
 
 module.exports = async function handler(req, res) {
-  res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+  setCors(req, res);
 
   if (req.method === "OPTIONS") {
     res.status(200).end();

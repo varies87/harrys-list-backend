@@ -22,9 +22,13 @@
  * ---------------------------------------------------------------------------
  */
 
-const { createClient } = require("@supabase/supabase-js");
-
-const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SECRET_KEY);
+const {
+  supabase,
+  getAuthedUser,
+  setCors,
+  rateLimit,
+  clientIp,
+} = require("./_shared");
 
 function rowToHomeowner(row) {
   return {
@@ -37,23 +41,6 @@ function rowToHomeowner(row) {
       ? row.favorite_contractor_ids.split(",").filter(Boolean)
       : [],
   };
-}
-
-/**
- * Verifies the Authorization header against Supabase Auth and returns the
- * authenticated user's id (a uuid) and email -- or null if there's no
- * valid session. supabase.auth.getUser() cryptographically verifies the
- * token was genuinely issued by Supabase Auth for this project. A forged
- * or expired token fails here.
- */
-async function getAuthedUser(req) {
-  const authHeader = req.headers["authorization"] || req.headers["Authorization"];
-  if (!authHeader || !authHeader.startsWith("Bearer ")) return null;
-  const token = authHeader.slice("Bearer ".length);
-
-  const { data, error } = await supabase.auth.getUser(token);
-  if (error || !data?.user) return null;
-  return { id: data.user.id, email: data.user.email };
 }
 
 async function findHomeownerByAuthId(authUserId) {
@@ -146,6 +133,9 @@ async function handleHomeownersRequest(body, req) {
       if (existing) {
         return { statusCode: 200, body: { homeowner: existing } };
       }
+      if (!(await rateLimit(`homeowner-create:${clientIp(req)}`, { max: 5, windowMs: 60 * 60 * 1000 }))) {
+        return { statusCode: 429, body: { error: "Too many requests. Please try again later." } };
+      }
       const homeowner = await createHomeownerForAuthUser(authUser, body.name, body.zip, body.phone || null);
       return { statusCode: 200, body: { homeowner } };
     }
@@ -176,9 +166,7 @@ async function handleHomeownersRequest(body, req) {
 }
 
 module.exports = async function handler(req, res) {
-  res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+  setCors(req, res);
 
   if (req.method === "OPTIONS") {
     res.status(200).end();

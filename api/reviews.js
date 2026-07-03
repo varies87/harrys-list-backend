@@ -16,16 +16,14 @@
  * ---------------------------------------------------------------------------
  */
 
-const { createClient } = require("@supabase/supabase-js");
-
-const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SECRET_KEY);
-
-/** See the matching comment in jobs.js / quotes.js -- ids are int8 in the database. */
-function toId(value) {
-  if (value === null || value === undefined || value === "") return value;
-  const n = Number(value);
-  return Number.isNaN(n) ? value : n;
-}
+const {
+  supabase,
+  toId,
+  getAuthedUser,
+  setCors,
+  rateLimit,
+  clientIp,
+} = require("./_shared");
 
 function rowToReview(row) {
   return {
@@ -137,36 +135,40 @@ async function toggleThumbsUp(contractorId, homeownerId) {
 }
 
 /**
- * Small helpers that bump the denormalized counter. Read-then-write rather
- * than a single atomic SQL increment, since the Supabase JS client doesn't
- * expose raw SQL expressions for updates -- acceptable here because thumbs
- * up isn't a high-contention path (one click per homeowner per contractor,
- * not a hot counter being hit many times per second).
+ * Atomically adjusts the denormalized thumbs_up_count via a Postgres function
+ * (see the increment_thumbs_up migration in the repo notes). The previous
+ * read-then-write pattern could lose concurrent updates (L-6). If the RPC is
+ * not present yet, we fall back to the old non-atomic path so the feature
+ * keeps working until the migration is applied.
  */
-async function incrementThumbsUpCount(contractorId) {
+async function adjustThumbsUpCount(contractorId, delta) {
+  const { error } = await supabase.rpc("increment_thumbs_up", {
+    p_contractor_id: contractorId,
+    p_delta: delta,
+  });
+  if (!error) return;
+
+  // Fallback (non-atomic) -- only reached if the RPC is missing.
   const { data, error: readError } = await supabase
     .from("contractors")
     .select("thumbs_up_count")
     .eq("id", contractorId)
     .single();
   if (readError) throw new Error("Could not read thumbs up count: " + readError.message);
+  const next = Math.max(0, (data.thumbs_up_count || 0) + delta);
   const { error: writeError } = await supabase
     .from("contractors")
-    .update({ thumbs_up_count: (data.thumbs_up_count || 0) + 1 })
+    .update({ thumbs_up_count: next })
     .eq("id", contractorId);
   if (writeError) throw new Error("Could not update thumbs up count: " + writeError.message);
 }
 
+async function incrementThumbsUpCount(contractorId) {
+  return adjustThumbsUpCount(contractorId, 1);
+}
+
 async function decrementThumbsUpCount(contractorId) {
-  const { data, error: readError } = await supabase
-    .from("contractors")
-    .select("thumbs_up_count")
-    .eq("id", contractorId)
-    .single();
-  if (readError) throw new Error("Could not read thumbs up count: " + readError.message);
-  const next = Math.max(0, (data.thumbs_up_count || 0) - 1);
-  const { error: writeError } = await supabase.from("contractors").update({ thumbs_up_count: next }).eq("id", contractorId);
-  if (writeError) throw new Error("Could not update thumbs up count: " + writeError.message);
+  return adjustThumbsUpCount(contractorId, -1);
 }
 
 /**
@@ -185,15 +187,6 @@ async function getThumbsUpStatus(contractorId, homeownerId) {
     .maybeSingle();
   if (error) throw new Error("Could not check thumbs up status: " + error.message);
   return { alreadyThumbsUpped: !!data };
-}
-
-async function getAuthedUser(req) {
-  const authHeader = req.headers["authorization"] || req.headers["Authorization"];
-  if (!authHeader || !authHeader.startsWith("Bearer ")) return null;
-  const token = authHeader.slice("Bearer ".length);
-  const { data, error } = await supabase.auth.getUser(token);
-  if (error || !data?.user) return null;
-  return { id: data.user.id, email: data.user.email };
 }
 
 async function handleReviewsRequest(body, req) {
@@ -243,8 +236,14 @@ async function handleReviewsRequest(body, req) {
       if (!contractorId || !jobId || !rating) {
         return { statusCode: 400, body: { error: "contractorId, jobId, and rating are required." } };
       }
-      if (rating < 1 || rating > 5) {
-        return { statusCode: 400, body: { error: "rating must be between 1 and 5." } };
+      if (!Number.isInteger(rating) || rating < 1 || rating > 5) {
+        return { statusCode: 400, body: { error: "rating must be a whole number between 1 and 5." } };
+      }
+      if (body.text && String(body.text).length > 5000) {
+        return { statusCode: 400, body: { error: "Review text must be 5000 characters or less." } };
+      }
+      if (!(await rateLimit(`review-create:${clientIp(req)}`, { max: 20, windowMs: 60 * 60 * 1000 }))) {
+        return { statusCode: 429, body: { error: "Too many requests. Please try again later." } };
       }
       // homeownerId comes from the verified session, not the request body.
       const review = await createReview({ contractorId, homeownerId, jobId, rating, text: body.text });
@@ -255,6 +254,9 @@ async function handleReviewsRequest(body, req) {
       if (!homeownerId) return { statusCode: 403, body: { error: "No homeowner profile found for this account." } };
       if (!body.contractorId) {
         return { statusCode: 400, body: { error: "contractorId is required." } };
+      }
+      if (!(await rateLimit(`thumbsup:${clientIp(req)}`, { max: 60, windowMs: 60 * 60 * 1000 }))) {
+        return { statusCode: 429, body: { error: "Too many requests. Please try again later." } };
       }
       // homeownerId comes from the verified session.
       const result = await toggleThumbsUp(body.contractorId, homeownerId);
@@ -269,9 +271,7 @@ async function handleReviewsRequest(body, req) {
 }
 
 module.exports = async function handler(req, res) {
-  res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+  setCors(req, res);
 
   if (req.method === "OPTIONS") {
     res.status(200).end();

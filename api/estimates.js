@@ -18,25 +18,15 @@
  * ---------------------------------------------------------------------------
  */
 
-const { createClient } = require("@supabase/supabase-js");
 const { emailHomeownerEstimateRequest } = require("./email");
-
-const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SECRET_KEY);
-
-function toId(value) {
-  if (value === null || value === undefined || value === "") return value;
-  const n = Number(value);
-  return Number.isNaN(n) ? value : n;
-}
-
-async function getAuthedUser(req) {
-  const authHeader = req.headers["authorization"] || req.headers["Authorization"];
-  if (!authHeader || !authHeader.startsWith("Bearer ")) return null;
-  const token = authHeader.slice("Bearer ".length);
-  const { data, error } = await supabase.auth.getUser(token);
-  if (error || !data?.user) return null;
-  return { id: data.user.id, email: data.user.email };
-}
+const {
+  supabase,
+  toId,
+  getAuthedUser,
+  setCors,
+  rateLimit,
+  clientIp,
+} = require("./_shared");
 
 async function getProfileIds(authUserId) {
   const [homeownerRes, contractorRes] = await Promise.allSettled([
@@ -241,6 +231,12 @@ async function handleEstimatesRequest(body, req) {
     if (action === "request") {
       if (!contractorId) return { statusCode: 403, body: { error: "No contractor profile found for this account." } };
       if (!body.quoteRequestId) return { statusCode: 400, body: { error: "quoteRequestId is required." } };
+      if (body.message && String(body.message).length > 2000) {
+        return { statusCode: 400, body: { error: "Message must be 2000 characters or less." } };
+      }
+      if (!(await rateLimit(`estimate-request:${clientIp(req)}`, { max: 30, windowMs: 60 * 60 * 1000 }))) {
+        return { statusCode: 429, body: { error: "Too many requests. Please try again later." } };
+      }
       const estimateRequest = await requestEstimate(contractorId, body.quoteRequestId, body.message || null);
       return { statusCode: 200, body: { estimateRequest } };
     }
@@ -277,9 +273,7 @@ async function handleEstimatesRequest(body, req) {
 }
 
 module.exports = async function handler(req, res) {
-  res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+  setCors(req, res);
 
   if (req.method === "OPTIONS") {
     res.status(200).end();

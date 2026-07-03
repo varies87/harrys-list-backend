@@ -32,26 +32,17 @@
  * ---------------------------------------------------------------------------
  */
 
-const { createClient } = require("@supabase/supabase-js");
 const { emailContractorApproved } = require("./email");
-
-const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SECRET_KEY);
-
-function toId(value) {
-  if (value === null || value === undefined || value === "") return value;
-  const n = Number(value);
-  return Number.isNaN(n) ? value : n;
-}
-
-async function getAuthedUser(req) {
-  const authHeader = req.headers["authorization"] || req.headers["Authorization"];
-  if (!authHeader || !authHeader.startsWith("Bearer ")) return null;
-  const token = authHeader.slice("Bearer ".length);
-
-  const { data, error } = await supabase.auth.getUser(token);
-  if (error || !data?.user) return null;
-  return { id: data.user.id, email: data.user.email };
-}
+const {
+  supabase,
+  toId,
+  getAuthedUser,
+  setCors,
+  checkAdminPassword,
+  rateLimit,
+  clientIp,
+  validateImageUpload,
+} = require("./_shared");
 
 function generateSlug(businessName) {
   return businessName
@@ -99,7 +90,9 @@ function contractorToRow(contractor) {
     const zips = contractor.serviceArea.zipCodes;
     row.service_area_zips = Array.isArray(zips) ? zips.join(",") : "";
   }
-  if (contractor.status !== undefined) row.status = contractor.status;
+  // NOTE: `status` is intentionally NOT mapped here. It is an admin-only gate
+  // written directly by setContractorStatus / the create path. Mapping it here
+  // previously let a contractor self-approve via the "update" action (C-1).
   if (contractor.logoUrl !== undefined) row.logo_url = contractor.logoUrl;
   return row;
 }
@@ -141,46 +134,8 @@ async function listPendingContractors() {
   return data.map((row) => rowToContractor(row));
 }
 
-// In-memory rate limiter for admin password attempts.
-// Vercel serverless functions are stateless across requests, so this resets
-// on cold starts -- but it still catches rapid brute-force attempts within
-// the same function instance's lifetime, which covers the main attack vector.
-const adminAttempts = new Map(); // ip -> { count, resetAt }
-const MAX_ADMIN_ATTEMPTS = 5;
-const ADMIN_LOCKOUT_MS = 60 * 60 * 1000; // 1 hour
-
-function checkAdminPassword(password, req) {
-  const ip = (req && (req.headers["x-forwarded-for"] || req.socket?.remoteAddress)) || "unknown";
-  const now = Date.now();
-  const record = adminAttempts.get(ip);
-
-  // Check if currently locked out
-  if (record && record.count >= MAX_ADMIN_ATTEMPTS && now < record.resetAt) {
-    const minutesLeft = Math.ceil((record.resetAt - now) / 60000);
-    throw new Error(`Too many failed attempts. Try again in ${minutesLeft} minute${minutesLeft === 1 ? "" : "s"}.`);
-  }
-
-  // Reset if lockout period has expired
-  if (record && now >= record.resetAt) {
-    adminAttempts.delete(ip);
-  }
-
-  const realPassword = process.env.ADMIN_PASSWORD;
-  if (!realPassword) {
-    console.error("WARNING: ADMIN_PASSWORD environment variable is not set. Admin panel will be inaccessible.");
-    return false;
-  }
-
-  if (password === realPassword) {
-    adminAttempts.delete(ip); // clear on success
-    return true;
-  }
-
-  // Wrong password -- increment attempt count
-  const current = adminAttempts.get(ip) || { count: 0, resetAt: now + ADMIN_LOCKOUT_MS };
-  adminAttempts.set(ip, { count: current.count + 1, resetAt: current.resetAt });
-  return false;
-}
+// Admin auth (constant-time compare + durable rate limit) now lives in
+// ./_shared as checkAdminPassword. It is async, so call sites use `await`.
 
 async function findContractorByAuthId(authUserId) {
   const { data, error } = await supabase
@@ -222,8 +177,25 @@ async function createContractorForAuthUser(authUser, contractor) {
   return rowToContractor(data);
 }
 
+// A contractor may only edit these fields on their own profile. `status`,
+// `is_suspended`, `slug`, `email`, `auth_user_id`, etc. are deliberately absent
+// so they can never be set through the self-service "update" action.
+const CONTRACTOR_EDITABLE_FIELDS = [
+  "businessName",
+  "trade",
+  "yearsInBusiness",
+  "bio",
+  "licenseInfo",
+  "serviceArea",
+  "logoUrl",
+];
+
 async function updateMyContractor(authUserId, updates) {
-  const row = contractorToRow(updates);
+  const safeUpdates = {};
+  for (const key of CONTRACTOR_EDITABLE_FIELDS) {
+    if (updates[key] !== undefined) safeUpdates[key] = updates[key];
+  }
+  const row = contractorToRow(safeUpdates);
   // Deliberately do NOT regenerate slug on business name change --
   // the slug is set once at creation and never changes so existing
   // shared links and QR codes keep working.
@@ -279,28 +251,38 @@ async function uploadPortfolioPhoto(authUserId, fileBase64, fileName, contentTyp
     throw new Error(`Portfolio is full — maximum ${MAX_PORTFOLIO_PHOTOS} photos allowed. Delete some to add more.`);
   }
 
+  // Verify the upload is a real image (PNG/JPEG/WebP) by its bytes -- not the
+  // client-declared content-type -- and use a sanitized filename. Rejects SVG
+  // and content-type confusion attacks.
+  const { buffer, contentType: safeType, safeName } = validateImageUpload(fileBase64, fileName);
   const ts = Date.now();
-  const buffer = Buffer.from(fileBase64, "base64");
-  const path = `${contractor.id}/${ts}-${fileName}`;
+  const path = `${contractor.id}/${ts}-${safeName}`;
 
   const { error: uploadError } = await supabase.storage
     .from("portfolio-photos")
-    .upload(path, buffer, { contentType, upsert: false });
+    .upload(path, buffer, { contentType: safeType, upsert: false });
   if (uploadError) throw new Error("Could not upload photo: " + uploadError.message);
 
   const { data: urlData } = supabase.storage.from("portfolio-photos").getPublicUrl(path);
 
-  // Upload thumbnail if provided
+  // Upload thumbnail if provided (also validated; skipped if not a valid image)
   let thumbnailUrl = null;
   if (thumbnailBase64) {
-    const thumbBuffer = Buffer.from(thumbnailBase64, "base64");
-    const thumbPath = `${contractor.id}/${ts}-thumb-${fileName}`;
-    const { error: thumbError } = await supabase.storage
-      .from("portfolio-photos")
-      .upload(thumbPath, thumbBuffer, { contentType: "image/jpeg", upsert: false });
-    if (!thumbError) {
-      const { data: thumbUrlData } = supabase.storage.from("portfolio-photos").getPublicUrl(thumbPath);
-      thumbnailUrl = thumbUrlData.publicUrl;
+    try {
+      const { buffer: thumbBuffer, contentType: thumbType } = validateImageUpload(
+        thumbnailBase64,
+        `thumb-${safeName}`
+      );
+      const thumbPath = `${contractor.id}/${ts}-thumb-${safeName}`;
+      const { error: thumbError } = await supabase.storage
+        .from("portfolio-photos")
+        .upload(thumbPath, thumbBuffer, { contentType: thumbType, upsert: false });
+      if (!thumbError) {
+        const { data: thumbUrlData } = supabase.storage.from("portfolio-photos").getPublicUrl(thumbPath);
+        thumbnailUrl = thumbUrlData.publicUrl;
+      }
+    } catch (_) {
+      /* invalid thumbnail -- skip it, keep the main photo */
     }
   }
 
@@ -445,12 +427,12 @@ async function uploadLogoForAuthUser(authUserId, fileBase64, fileName, contentTy
     .single();
   if (lookupError || !existing) throw new Error("You don't have a contractor profile yet.");
 
-  const buffer = Buffer.from(fileBase64, "base64");
-  const path = `${existing.id}/${Date.now()}-${fileName}`;
+  const { buffer, contentType: safeType, safeName } = validateImageUpload(fileBase64, fileName);
+  const path = `${existing.id}/${Date.now()}-${safeName}`;
 
   const { error: uploadError } = await supabase.storage
     .from("contractor-logos")
-    .upload(path, buffer, { contentType, upsert: true });
+    .upload(path, buffer, { contentType: safeType, upsert: true });
   if (uploadError) throw new Error("Could not upload logo: " + uploadError.message);
 
   const { data: publicUrlData } = supabase.storage.from("contractor-logos").getPublicUrl(path);
@@ -511,7 +493,7 @@ async function handleContractorsRequest(body, req) {
 
     if (action === "listApproved") {
       try {
-        if (!checkAdminPassword(body.adminPassword, req)) {
+        if (!(await checkAdminPassword(body.adminPassword, req))) {
           return { statusCode: 401, body: { error: "Incorrect admin password." } };
         }
       } catch (err) {
@@ -528,7 +510,7 @@ async function handleContractorsRequest(body, req) {
 
     if (action === "listArchived") {
       try {
-        if (!checkAdminPassword(body.adminPassword, req)) {
+        if (!(await checkAdminPassword(body.adminPassword, req))) {
           return { statusCode: 401, body: { error: "Incorrect admin password." } };
         }
       } catch (err) {
@@ -545,7 +527,7 @@ async function handleContractorsRequest(body, req) {
 
     if (action === "listPending") {
       try {
-        if (!checkAdminPassword(body.adminPassword, req)) {
+        if (!(await checkAdminPassword(body.adminPassword, req))) {
           return { statusCode: 401, body: { error: "Incorrect admin password." } };
         }
       } catch (err) {
@@ -557,7 +539,7 @@ async function handleContractorsRequest(body, req) {
 
     if (action === "setStatus") {
       try {
-        if (!checkAdminPassword(body.adminPassword, req)) {
+        if (!(await checkAdminPassword(body.adminPassword, req))) {
           return { statusCode: 401, body: { error: "Incorrect admin password." } };
         }
       } catch (err) {
@@ -599,6 +581,9 @@ async function handleContractorsRequest(body, req) {
       }
       if (body.contractor.bio && body.contractor.bio.length > 2000) {
         return { statusCode: 400, body: { error: "Bio must be 2000 characters or less." } };
+      }
+      if (!(await rateLimit(`contractor-create:${clientIp(req)}`, { max: 5, windowMs: 60 * 60 * 1000 }))) {
+        return { statusCode: 429, body: { error: "Too many requests. Please try again later." } };
       }
       const contractor = await createContractorForAuthUser(authUser, body.contractor);
       return { statusCode: 200, body: { contractor } };
@@ -668,9 +653,7 @@ async function handleContractorsRequest(body, req) {
 }
 
 module.exports = async function handler(req, res) {
-  res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+  setCors(req, res);
 
   if (req.method === "OPTIONS") {
     res.status(200).end();

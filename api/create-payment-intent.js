@@ -13,19 +13,11 @@
  */
 
 const Stripe = require("stripe");
-const { createClient } = require("@supabase/supabase-js");
+const { supabase, toId, getAuthedUser, setCors } = require("./_shared");
 
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY, {
   apiVersion: "2024-06-20",
 });
-
-const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SECRET_KEY);
-
-function toId(value) {
-  if (value === null || value === undefined || value === "") return value;
-  const n = Number(value);
-  return Number.isNaN(n) ? value : n;
-}
 
 const FEE_BRACKETS = [
   { upTo: 500, rate: 0.04 },
@@ -46,10 +38,10 @@ function feeOwedForAmount(amount) {
   return Math.round(owed * 100) / 100;
 }
 
-async function getJobReportedAmount(jobId) {
+async function getJobForFee(jobId) {
   const { data, error } = await supabase
     .from("completed_jobs")
-    .select("reported_amount, status, fee_paid")
+    .select("reported_amount, status, fee_paid, contractor_id")
     .eq("id", toId(jobId))
     .single();
 
@@ -62,23 +54,50 @@ async function getJobReportedAmount(jobId) {
   if (data.fee_paid) {
     throw new Error("This job's fee has already been paid.");
   }
-  return Number(data.reported_amount);
+  return {
+    reportedAmount: Number(data.reported_amount),
+    contractorId: data.contractor_id,
+  };
 }
 
-async function handleCreatePaymentIntent(body) {
-  const { jobId, contractorId } = body || {};
-
-  if (!jobId || !contractorId) {
-    return { statusCode: 400, body: { error: "jobId and contractorId are required." } };
+async function handleCreatePaymentIntent(body, req) {
+  // Require a verified session and resolve the caller's contractor id
+  // server-side. The endpoint was previously unauthenticated (M-8): anyone
+  // could POST a jobId/contractorId to read the computed fee and spam
+  // PaymentIntents for arbitrary jobs.
+  const authUser = await getAuthedUser(req);
+  if (!authUser) {
+    return { statusCode: 401, body: { error: "Authentication required." } };
   }
 
-  let reportedAmount;
+  const { jobId } = body || {};
+  if (!jobId) {
+    return { statusCode: 400, body: { error: "jobId is required." } };
+  }
+
+  const { data: contractor, error: cErr } = await supabase
+    .from("contractors")
+    .select("id")
+    .eq("auth_user_id", authUser.id)
+    .maybeSingle();
+  if (cErr || !contractor) {
+    return { statusCode: 403, body: { error: "No contractor profile for this account." } };
+  }
+  const contractorId = contractor.id;
+
+  let job;
   try {
-    reportedAmount = await getJobReportedAmount(jobId);
+    job = await getJobForFee(jobId);
   } catch (err) {
     return { statusCode: 404, body: { error: err.message } };
   }
 
+  // The job must belong to the authenticated contractor.
+  if (toId(job.contractorId) !== toId(contractorId)) {
+    return { statusCode: 403, body: { error: "This job does not belong to your account." } };
+  }
+
+  const reportedAmount = job.reportedAmount;
   const feeOwed = feeOwedForAmount(reportedAmount);
   const amountInCents = Math.round(feeOwed * 100);
 
@@ -123,9 +142,7 @@ async function handleCreatePaymentIntent(body) {
 }
 
 module.exports = async function handler(req, res) {
-  res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+  setCors(req, res);
 
   if (req.method === "OPTIONS") {
     res.status(200).end();
@@ -136,10 +153,10 @@ module.exports = async function handler(req, res) {
     res.status(405).json({ error: "Method not allowed" });
     return;
   }
-  const result = await handleCreatePaymentIntent(req.body);
+  const result = await handleCreatePaymentIntent(req.body, req);
   res.status(result.statusCode).json(result.body);
 };
 
 module.exports.feeOwedForAmount = feeOwedForAmount;
 module.exports.handleCreatePaymentIntent = handleCreatePaymentIntent;
-module.exports.getJobReportedAmount = getJobReportedAmount;
+module.exports.getJobForFee = getJobForFee;
