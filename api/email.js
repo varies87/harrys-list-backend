@@ -227,14 +227,71 @@ async function emailHomeownerAutoConfirmed({ homeownerEmail, homeownerName, cont
   });
 }
 
+/** Contractor approved — notify them to log in */
+async function emailContractorApproved({ contractorEmail, contractorName }) {
+  await sendEmail({
+    to: contractorEmail,
+    subject: `You're approved on Harry's List DFW 🎉`,
+    html: baseTemplate(`
+      <p>Hi ${contractorName},</p>
+      <p>Great news — your Harry's List profile has been approved. You're now listed in the DFW trade directory and homeowners in your service area can find you and send quote requests.</p>
+      <p><strong>What happens next:</strong></p>
+      <ul style="margin: 12px 0 16px; padding-left: 20px; color: #3D4F42; font-size: 14px; line-height: 1.8;">
+        <li>Log in to your contractor portal to check for quote requests</li>
+        <li>Share your profile link with existing customers to collect reviews</li>
+        <li>You only pay a small platform fee after a job is confirmed complete</li>
+      </ul>
+      <a href="${BASE_URL}/contractors" class="btn">Log in to your portal →</a>
+      <p style="margin-top: 16px;">Remember — no contractor here paid to be listed. Your ranking is determined purely by your reviews and reputation.</p>
+    `),
+  });
+}
+
+/** Contractor notified when homeowner disputes their job report */
+async function emailContractorJobDisputed({ contractorEmail, contractorName, description, reportedAmount, disputeNote }) {
+  await sendEmail({
+    to: contractorEmail,
+    subject: `A homeowner disputed your job report — Harry's List`,
+    html: baseTemplate(`
+      <p>Hi ${contractorName},</p>
+      <p>A homeowner has disputed the reported amount for the following job:</p>
+      <p><strong>${description}</strong><br/>
+      Your reported amount: <strong>$${Number(reportedAmount).toLocaleString()}</strong></p>
+      ${disputeNote ? `<p>Homeowner's note: <em>"${disputeNote}"</em></p>` : ""}
+      <p>Log in to your portal to view the dispute and edit your reported amount if needed. Once you update it, the homeowner will be prompted to confirm again.</p>
+      <a href="${BASE_URL}/contractors" class="btn">View dispute →</a>
+      <p>If you believe the amount is correct, contact us at <a href="mailto:harry@harryslistdfw.com">harry@harryslistdfw.com</a> and we'll help resolve it.</p>
+    `),
+  });
+}
+
+/** Homeowner notified when contractor updates disputed amount */
+async function emailHomeownerDisputeUpdated({ homeownerEmail, homeownerName, contractorName, newAmount, description }) {
+  await sendEmail({
+    to: homeownerEmail,
+    subject: `${contractorName} updated the job amount — please confirm`,
+    html: baseTemplate(`
+      <p>Hi ${homeownerName},</p>
+      <p><strong>${contractorName}</strong> has updated the reported amount for your job:</p>
+      <p><strong>${description}</strong><br/>
+      Updated amount: <strong>$${Number(newAmount).toLocaleString()}</strong></p>
+      <p>Please log in to confirm or dispute the updated amount.</p>
+      <a href="${BASE_URL}" class="btn">Review updated amount →</a>
+    `),
+  });
+}
+
 module.exports = {
   emailHomeownerQuoteReceived,
   emailHomeownerConfirmJob,
   emailHomeownerConfirmReminder,
   emailHomeownerAutoConfirmed,
   emailHomeownerEstimateRequest,
+  emailHomeownerDisputeUpdated,
   emailContractorNewQuote,
   emailContractorJobConfirmed,
+  emailContractorJobDisputed,
   emailContractorPaymentOverdue,
   emailContractorMarkComplete,
+  emailContractorApproved,
 };
