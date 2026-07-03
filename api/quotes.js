@@ -19,6 +19,12 @@
  */
 
 const { createClient } = require("@supabase/supabase-js");
+const {
+  emailHomeownerQuoteReceived,
+  emailHomeownerEstimateRequest,
+  emailContractorNewQuote,
+  emailContractorMarkComplete,
+} = require("./email");
 
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SECRET_KEY);
 
@@ -95,6 +101,26 @@ async function createQuoteRequest({ homeownerId, description, budget, timeline, 
     .select();
   if (recipientsError) throw new Error("Could not create quote recipients: " + recipientsError.message);
 
+  // Email each contractor about the new request
+  const { data: contractorRows } = await supabase
+    .from("contractors")
+    .select("business_name, email")
+    .in("id", contractorIds.map(toId));
+  if (contractorRows) {
+    contractorRows.forEach((c) => {
+      if (c.email) {
+        emailContractorNewQuote({
+          contractorEmail: c.email,
+          contractorName: c.business_name,
+          description: qr.description,
+          zip: qr.zip,
+          budget: qr.budget,
+          timeline: qr.timeline,
+        }).catch(() => {});
+      }
+    });
+  }
+
   return rowToQuoteRequest(qr, recipients);
 }
 
@@ -170,6 +196,36 @@ async function respondToQuote(quoteRequestId, contractorId, status, price, messa
     .eq("quote_request_id", toId(quoteRequestId))
     .eq("contractor_id", toId(contractorId));
   if (error) throw new Error("Could not update quote response: " + error.message);
+
+  // Email homeowner when contractor responds with a quote
+  if (status === "responded") {
+    const { data: qr } = await supabase
+      .from("quote_requests")
+      .select("description, homeowner_id")
+      .eq("id", toId(quoteRequestId))
+      .maybeSingle();
+    const { data: contractor } = await supabase
+      .from("contractors")
+      .select("business_name")
+      .eq("id", toId(contractorId))
+      .maybeSingle();
+    if (qr?.homeowner_id) {
+      const { data: homeowner } = await supabase
+        .from("homeowners")
+        .select("name, email")
+        .eq("id", toId(qr.homeowner_id))
+        .maybeSingle();
+      if (homeowner?.email) {
+        emailHomeownerQuoteReceived({
+          homeownerEmail: homeowner.email,
+          homeownerName: homeowner.name,
+          contractorName: contractor?.business_name || "A contractor",
+          price,
+          message,
+        }).catch(() => {});
+      }
+    }
+  }
 
   return { success: true };
 }
