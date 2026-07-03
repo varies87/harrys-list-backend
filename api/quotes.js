@@ -59,12 +59,13 @@ function rowToQuoteRequest(row, recipients) {
     budget: row.budget,
     timeline: row.timeline,
     zip: row.zip,
+    address: row.address || null,
     createdAt: row.created_at,
     recipients: recipients.map(rowToRecipient),
   };
 }
 
-async function createQuoteRequest({ homeownerId, description, budget, timeline, zip, contractorIds }) {
+async function createQuoteRequest({ homeownerId, description, budget, timeline, zip, address, contractorIds }) {
   // Check for existing open requests from this homeowner to any of the same contractors.
   // Two-step: first get all this homeowner's open quote request IDs, then check recipients.
   const { data: openRequests } = await supabase
@@ -88,7 +89,7 @@ async function createQuoteRequest({ homeownerId, description, budget, timeline, 
 
   const { data: qr, error: qrError } = await supabase
     .from("quote_requests")
-    .insert({ homeowner_id: toId(homeownerId), description, budget, timeline, zip })
+    .insert({ homeowner_id: toId(homeownerId), description, budget, timeline, zip, address: address || null })
     .select()
     .single();
   if (qrError) throw new Error("Could not create quote request: " + qrError.message);
@@ -156,7 +157,28 @@ async function listQuoteRequestsForContractor(contractorId) {
     .order("created_at", { ascending: false });
   if (reqError) throw new Error("Could not list quote requests: " + reqError.message);
 
-  return attachRecipients(requests);
+  const result = await attachRecipients(requests);
+
+  // For confirmed jobs (homeowner_marked_complete), fetch homeowner phone
+  const confirmedRequests = result.filter((qr) =>
+    qr.recipients.some((r) => r.contractorId === contractorId && r.homeownerMarkedComplete)
+  );
+  if (confirmedRequests.length > 0) {
+    const homeownerIds = [...new Set(confirmedRequests.map((qr) => qr.homeownerId).filter(Boolean))];
+    if (homeownerIds.length > 0) {
+      const { data: homeowners } = await supabase
+        .from("homeowners")
+        .select("id, phone")
+        .in("id", homeownerIds.map(toId));
+      const phoneMap = new Map((homeowners || []).map((h) => [String(h.id), h.phone]));
+      return result.map((qr) => {
+        const phone = phoneMap.get(String(qr.homeownerId));
+        return phone ? { ...qr, homeownerPhone: phone } : qr;
+      });
+    }
+  }
+
+  return result;
 }
 
 async function attachRecipients(requests) {
