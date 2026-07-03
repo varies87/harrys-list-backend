@@ -198,9 +198,40 @@ async function emailContractorMarkComplete({ contractorEmail, contractorName, de
   });
 }
 
+/** Reminder to homeowner 3 days after job reported — confirm or dispute */
+async function emailHomeownerConfirmReminder({ homeownerEmail, homeownerName, contractorName, reportedAmount, description, daysLeft }) {
+  await sendEmail({
+    to: homeownerEmail,
+    subject: `Reminder: confirm ${contractorName}'s job — ${daysLeft} days left`,
+    html: baseTemplate(`
+      <p>Hi ${homeownerName},</p>
+      <p>This is a reminder that <strong>${contractorName}</strong> reported the following job complete ${7 - daysLeft} days ago:</p>
+      <p><strong>${description}</strong><br/>Reported amount: <strong>$${Number(reportedAmount).toLocaleString()}</strong></p>
+      <p>You have <strong>${daysLeft} days</strong> to confirm or dispute this amount. If you take no action, it will be automatically confirmed.</p>
+      <a href="https://harryslistdfw.com" class="btn">Confirm or dispute →</a>
+    `),
+  });
+}
+
+/** Auto-confirm notification to homeowner */
+async function emailHomeownerAutoConfirmed({ homeownerEmail, homeownerName, contractorName, reportedAmount, description }) {
+  await sendEmail({
+    to: homeownerEmail,
+    subject: `Job automatically confirmed — Harry's List`,
+    html: baseTemplate(`
+      <p>Hi ${homeownerName},</p>
+      <p>The following job was automatically confirmed after 7 days with no dispute:</p>
+      <p><strong>${description}</strong><br/>Amount: <strong>$${Number(reportedAmount).toLocaleString()}</strong><br/>Contractor: ${contractorName}</p>
+      <p>If you believe this is incorrect, please contact us at <a href="mailto:harry@harryslistdfw.com">harry@harryslistdfw.com</a>.</p>
+    `),
+  });
+}
+
 module.exports = {
   emailHomeownerQuoteReceived,
   emailHomeownerConfirmJob,
+  emailHomeownerConfirmReminder,
+  emailHomeownerAutoConfirmed,
   emailHomeownerEstimateRequest,
   emailContractorNewQuote,
   emailContractorJobConfirmed,
