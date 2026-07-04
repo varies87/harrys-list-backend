@@ -98,6 +98,48 @@ async function handleCreatePaymentIntent(body, req) {
   }
 
   const reportedAmount = job.reportedAmount;
+
+  // Founding-member perk: the first 50 contractors pay ZERO fee on their
+  // first 3 completed jobs. Check eligibility (founding member + under the
+  // 3-job cap + this job not already waived).
+  const { data: founder } = await supabase
+    .from("contractors")
+    .select("is_founding_member, founding_free_jobs_used")
+    .eq("id", toId(contractorId))
+    .maybeSingle();
+  const { data: jobRow } = await supabase
+    .from("completed_jobs")
+    .select("fee_waived_founding")
+    .eq("id", toId(jobId))
+    .maybeSingle();
+
+  const eligibleForWaiver =
+    founder?.is_founding_member &&
+    (founder.founding_free_jobs_used || 0) < 3 &&
+    !jobRow?.fee_waived_founding;
+
+  if (eligibleForWaiver) {
+    // Mark the job as waived and increment the contractor's used-count, then
+    // settle the job as paid with a $0 fee -- no Stripe charge needed.
+    await supabase
+      .from("completed_jobs")
+      .update({ fee_waived_founding: true, fee_paid: true, fee_paid_at: new Date().toISOString(), status: "paid" })
+      .eq("id", toId(jobId));
+    await supabase
+      .from("contractors")
+      .update({ founding_free_jobs_used: (founder.founding_free_jobs_used || 0) + 1 })
+      .eq("id", toId(contractorId));
+    return {
+      statusCode: 200,
+      body: {
+        feeWaived: true,
+        foundingMember: true,
+        freeJobsRemaining: 3 - ((founder.founding_free_jobs_used || 0) + 1),
+        message: "Founding member — this job's fee is on the house.",
+      },
+    };
+  }
+
   const feeOwed = feeOwedForAmount(reportedAmount);
   const amountInCents = Math.round(feeOwed * 100);
 

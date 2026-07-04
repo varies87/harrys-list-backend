@@ -70,6 +70,8 @@ function rowToContractor(row, reviews) {
     },
     status: row.status,
     isSuspended: !!row.is_suspended,
+    isFoundingMember: !!row.is_founding_member,
+    foundingFreeJobsUsed: row.founding_free_jobs_used || 0,
     thumbsUp: row.thumbs_up_count || 0,
     thumbsDown: row.thumbs_down || 0,
     logoUrl: row.logo_url || null,
@@ -228,15 +230,35 @@ async function updateMyContractor(authUserId, updates) {
   return rowToContractor(data);
 }
 
+// The Founding 50: the first 50 contractors to reach "approved" become
+// founding members (permanent badge + zero fees on their first 3 jobs).
+const FOUNDING_MEMBER_CAP = 50;
+const FOUNDING_FREE_JOBS = 3;
+
 async function setContractorStatus(contractorId, status) {
-  // Fetch previous status so we can detect first-time approval
+  // Fetch previous status + founding flag so we can detect first-time approval
   const { data: existing } = await supabase
-    .from("contractors").select("status").eq("id", toId(contractorId)).maybeSingle();
+    .from("contractors").select("status, is_founding_member").eq("id", toId(contractorId)).maybeSingle();
   const previousStatus = existing?.status;
+
+  const updates = { status };
+
+  // On FIRST approval only, if there's still room under the cap, make them a
+  // founding member. Guarded so re-approvals (e.g. after a re-review) never
+  // re-trigger it, and so we never exceed 50.
+  if (status === "approved" && previousStatus !== "approved" && !existing?.is_founding_member) {
+    const { count } = await supabase
+      .from("contractors")
+      .select("id", { count: "exact", head: true })
+      .eq("is_founding_member", true);
+    if ((count || 0) < FOUNDING_MEMBER_CAP) {
+      updates.is_founding_member = true;
+    }
+  }
 
   const { data, error } = await supabase
     .from("contractors")
-    .update({ status })
+    .update(updates)
     .eq("id", toId(contractorId))
     .select()
     .single();
