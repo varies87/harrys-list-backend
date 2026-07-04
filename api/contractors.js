@@ -14,6 +14,7 @@
  *
  * Routes (distinguished by `action` in the request body):
  *   POST /api/contractors  { action: "list" }                                   <- public, no auth needed
+ *   POST /api/contractors  { action: "foundingStatus" }                          <- public, no auth needed
  *   POST /api/contractors  { action: "getMine" }                                <- auth required
  *   POST /api/contractors  { action: "create", contractor: {...} }              <- auth required, creates MY profile
  *   POST /api/contractors  { action: "update", updates: {...} }                 <- auth required, updates MY profile
@@ -231,9 +232,9 @@ async function updateMyContractor(authUserId, updates) {
 }
 
 // The Founding 50: the first 50 contractors to reach "approved" become
-// founding members (permanent badge + zero fees on their first 3 jobs).
+// founding members (permanent badge + zero platform fee on their first job).
 const FOUNDING_MEMBER_CAP = 50;
-const FOUNDING_FREE_JOBS = 3;
+const FOUNDING_FREE_JOBS = 1;
 
 async function setContractorStatus(contractorId, status) {
   // Fetch previous status + founding flag so we can detect first-time approval
@@ -500,6 +501,28 @@ async function handleContractorsRequest(body, req) {
     if (action === "list") {
       const contractors = await listContractors();
       return { statusCode: 200, body: { contractors } };
+    }
+
+    if (action === "foundingStatus") {
+      // Public: how many "Founding 50" spots remain. Drives the landing-page
+      // offer banner. Counts is_founding_member=true -- the SAME source
+      // setContractorStatus uses to cap the perk -- so the banner and the
+      // actual benefit switch off together the moment the 50th founder is
+      // approved. No auth: it exposes only an aggregate count.
+      const { count } = await supabase
+        .from("contractors")
+        .select("id", { count: "exact", head: true })
+        .eq("is_founding_member", true);
+      const founderCount = count || 0;
+      return {
+        statusCode: 200,
+        body: {
+          founderCount,
+          spotsLeft: Math.max(0, FOUNDING_MEMBER_CAP - founderCount),
+          cap: FOUNDING_MEMBER_CAP,
+          freeJobs: FOUNDING_FREE_JOBS,
+        },
+      };
     }
 
     if (action === "getWithReviews") {

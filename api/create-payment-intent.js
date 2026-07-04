@@ -100,8 +100,8 @@ async function handleCreatePaymentIntent(body, req) {
   const reportedAmount = job.reportedAmount;
 
   // Founding-member perk: the first 50 contractors pay ZERO fee on their
-  // first 3 completed jobs. Check eligibility (founding member + under the
-  // 3-job cap + this job not already waived).
+  // first completed job. Check eligibility (founding member + under the
+  // 1-job cap + this job not already waived).
   const { data: founder } = await supabase
     .from("contractors")
     .select("is_founding_member, founding_free_jobs_used")
@@ -115,7 +115,7 @@ async function handleCreatePaymentIntent(body, req) {
 
   const eligibleForWaiver =
     founder?.is_founding_member &&
-    (founder.founding_free_jobs_used || 0) < 3 &&
+    (founder.founding_free_jobs_used || 0) < 1 &&
     !jobRow?.fee_waived_founding;
 
   if (eligibleForWaiver) {
@@ -134,7 +134,7 @@ async function handleCreatePaymentIntent(body, req) {
       body: {
         feeWaived: true,
         foundingMember: true,
-        freeJobsRemaining: 3 - ((founder.founding_free_jobs_used || 0) + 1),
+        freeJobsRemaining: 1 - ((founder.founding_free_jobs_used || 0) + 1),
         message: "Founding member — this job's fee is on the house.",
       },
     };

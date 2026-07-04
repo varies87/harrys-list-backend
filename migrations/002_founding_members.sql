@@ -1,7 +1,7 @@
 -- 002_founding_members.sql
 -- "Founding 50" program: the first 50 approved contractors become founding
--- members. Founding members pay ZERO platform fee on their first 3 completed
--- jobs, and carry a permanent "Founding Member" badge.
+-- members. Founding members pay ZERO platform fee on their first completed
+-- job, and carry a permanent "Founding Member" badge.
 --
 -- Run this in the Supabase SQL Editor.
 
@@ -10,7 +10,7 @@ ALTER TABLE contractors
   ADD COLUMN IF NOT EXISTS is_founding_member BOOLEAN NOT NULL DEFAULT FALSE;
 
 -- How many of a founding member's completed jobs have had their fee waived so
--- far. Caps the free-jobs perk at 3 without needing to re-scan job history on
+-- far. Caps the free-jobs perk at 1 without needing to re-scan job history on
 -- every fee calculation.
 ALTER TABLE contractors
   ADD COLUMN IF NOT EXISTS founding_free_jobs_used INTEGER NOT NULL DEFAULT 0;
