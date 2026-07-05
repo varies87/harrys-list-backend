@@ -114,14 +114,20 @@ async function listContractors() {
   const contractorIds = data.map((c) => c.id);
   const { data: reviewRows } = await supabase
     .from("reviews")
-    .select("contractor_id, rating")
-    .in("contractor_id", contractorIds);
+    .select("id, contractor_id, rating, text_review, created_at")
+    .in("contractor_id", contractorIds)
+    .order("created_at", { ascending: false });
 
   // Group reviews by contractor
   const reviewsByContractor = new Map();
   (reviewRows || []).forEach((r) => {
     if (!reviewsByContractor.has(r.contractor_id)) reviewsByContractor.set(r.contractor_id, []);
-    reviewsByContractor.get(r.contractor_id).push({ rating: r.rating });
+    reviewsByContractor.get(r.contractor_id).push({
+      id: r.id,
+      rating: r.rating,
+      text: r.text_review || "",
+      createdAt: r.created_at,
+    });
   });
 
   return data.map((row) => rowToContractor(row, reviewsByContractor.get(row.id) || []));
