@@ -289,6 +289,14 @@ async function uploadPortfolioPhoto(authUserId, fileBase64, fileName, contentTyp
     .eq("auth_user_id", authUserId)
     .single();
   if (lookupError || !contractor) throw new Error("You don't have a contractor profile yet.");
+  return addPortfolioPhotoForContractor(contractor.id, fileBase64, fileName, contentType, caption, thumbnailBase64);
+}
+
+// Shared by the contractor self-service path and the admin path. Adds a photo
+// to the given contractor's portfolio. The CALLER is responsible for
+// authorization (auth user lookup, or admin password check).
+async function addPortfolioPhotoForContractor(contractorId, fileBase64, fileName, contentType, caption, thumbnailBase64) {
+  const contractor = { id: toId(contractorId) };
 
   const { count, error: countError } = await supabase
     .from("portfolio_photos")
@@ -477,7 +485,13 @@ async function uploadLogoForAuthUser(authUserId, fileBase64, fileName, contentTy
     .eq("auth_user_id", authUserId)
     .single();
   if (lookupError || !existing) throw new Error("You don't have a contractor profile yet.");
+  return saveLogoForContractor(existing.id, fileBase64, fileName);
+}
 
+// Shared by the contractor self-service path and the admin path. The CALLER is
+// responsible for authorization.
+async function saveLogoForContractor(contractorId, fileBase64, fileName) {
+  const existing = { id: toId(contractorId) };
   const { buffer, contentType: safeType, safeName } = validateImageUpload(fileBase64, fileName);
   const path = `${existing.id}/${Date.now()}-${safeName}`;
 
@@ -498,6 +512,55 @@ async function uploadLogoForAuthUser(authUserId, fileBase64, fileName, contentTy
   if (error) throw new Error("Could not save logo URL: " + error.message);
 
   return rowToContractor(data);
+}
+
+// ---------------------------------------------------------------------------
+// Admin-side edits. These let an admin (authenticated by the admin password,
+// checked at the call site) edit a contractor's profile and manage their
+// photos on their behalf -- for contractors who can't or won't do it
+// themselves. Each is keyed by contractorId, not auth_user_id.
+// ---------------------------------------------------------------------------
+async function adminUpdateContractor(contractorId, updates) {
+  const safeUpdates = {};
+  for (const key of CONTRACTOR_EDITABLE_FIELDS) {
+    if (updates[key] !== undefined) safeUpdates[key] = updates[key];
+  }
+  const row = contractorToRow(safeUpdates);
+  if (Object.keys(row).length === 0) throw new Error("No editable fields provided.");
+  const { data, error } = await supabase
+    .from("contractors")
+    .update(row)
+    .eq("id", toId(contractorId))
+    .select()
+    .single();
+  if (error) throw new Error("Could not update contractor: " + error.message);
+  return rowToContractor(data);
+}
+
+async function adminUploadLogo(contractorId, fileBase64, fileName) {
+  const { data: existing } = await supabase
+    .from("contractors").select("id").eq("id", toId(contractorId)).maybeSingle();
+  if (!existing) throw new Error("Contractor not found.");
+  return saveLogoForContractor(existing.id, fileBase64, fileName);
+}
+
+async function adminUploadPortfolioPhoto(contractorId, fileBase64, fileName, contentType, caption, thumbnailBase64) {
+  const { data: existing } = await supabase
+    .from("contractors").select("id").eq("id", toId(contractorId)).maybeSingle();
+  if (!existing) throw new Error("Contractor not found.");
+  return addPortfolioPhotoForContractor(existing.id, fileBase64, fileName, contentType, caption, thumbnailBase64);
+}
+
+async function adminDeletePortfolioPhoto(photoId) {
+  const { data: photo, error: photoError } = await supabase
+    .from("portfolio_photos").select("id, storage_path").eq("id", toId(photoId)).maybeSingle();
+  if (photoError) throw new Error("Could not find photo: " + photoError.message);
+  if (!photo) throw new Error("Photo not found.");
+  await supabase.storage.from("portfolio-photos").remove([photo.storage_path]);
+  const { error: deleteError } = await supabase
+    .from("portfolio_photos").delete().eq("id", toId(photoId));
+  if (deleteError) throw new Error("Could not delete photo record: " + deleteError.message);
+  return { deleted: true, photoId };
 }
 
 async function handleContractorsRequest(body, req) {
@@ -633,6 +696,79 @@ async function handleContractorsRequest(body, req) {
         }).catch(() => {});
       }
       return { statusCode: 200, body: { contractor } };
+    }
+
+    if (action === "adminUpdateContractor") {
+      try {
+        if (!(await checkAdminPassword(body.adminPassword, req))) {
+          return { statusCode: 401, body: { error: "Incorrect admin password." } };
+        }
+      } catch (err) {
+        return { statusCode: 429, body: { error: err.message } };
+      }
+      if (!body.contractorId || !body.updates) {
+        return { statusCode: 400, body: { error: "contractorId and updates are required." } };
+      }
+      if (body.updates.businessName && body.updates.businessName.length > 100) {
+        return { statusCode: 400, body: { error: "Business name must be 100 characters or less." } };
+      }
+      if (body.updates.bio && body.updates.bio.length > 2000) {
+        return { statusCode: 400, body: { error: "Bio must be 2000 characters or less." } };
+      }
+      const contractor = await adminUpdateContractor(body.contractorId, body.updates);
+      return { statusCode: 200, body: { contractor } };
+    }
+
+    if (action === "adminUploadLogo") {
+      try {
+        if (!(await checkAdminPassword(body.adminPassword, req))) {
+          return { statusCode: 401, body: { error: "Incorrect admin password." } };
+        }
+      } catch (err) {
+        return { statusCode: 429, body: { error: err.message } };
+      }
+      if (!body.contractorId || !body.fileBase64 || !body.fileName) {
+        return { statusCode: 400, body: { error: "contractorId, fileBase64 and fileName are required." } };
+      }
+      const contractor = await adminUploadLogo(body.contractorId, body.fileBase64, body.fileName);
+      return { statusCode: 200, body: { contractor } };
+    }
+
+    if (action === "adminUploadPortfolioPhoto") {
+      try {
+        if (!(await checkAdminPassword(body.adminPassword, req))) {
+          return { statusCode: 401, body: { error: "Incorrect admin password." } };
+        }
+      } catch (err) {
+        return { statusCode: 429, body: { error: err.message } };
+      }
+      if (!body.contractorId || !body.fileBase64 || !body.fileName) {
+        return { statusCode: 400, body: { error: "contractorId, fileBase64 and fileName are required." } };
+      }
+      const photo = await adminUploadPortfolioPhoto(
+        body.contractorId,
+        body.fileBase64,
+        body.fileName,
+        body.contentType || "image/jpeg",
+        body.caption || null,
+        body.thumbnailBase64 || null
+      );
+      return { statusCode: 200, body: { photo } };
+    }
+
+    if (action === "adminDeletePortfolioPhoto") {
+      try {
+        if (!(await checkAdminPassword(body.adminPassword, req))) {
+          return { statusCode: 401, body: { error: "Incorrect admin password." } };
+        }
+      } catch (err) {
+        return { statusCode: 429, body: { error: err.message } };
+      }
+      if (!body.photoId) {
+        return { statusCode: 400, body: { error: "photoId is required." } };
+      }
+      const result = await adminDeletePortfolioPhoto(body.photoId);
+      return { statusCode: 200, body: result };
     }
 
     const authUser = await getAuthedUser(req);
