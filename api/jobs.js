@@ -793,6 +793,10 @@ async function handleJobsRequest(body, req) {
       if (!description || !reportedAmount) {
         return { statusCode: 400, body: { error: "description and reportedAmount are required." } };
       }
+      const amt = Number(reportedAmount);
+      if (!Number.isFinite(amt) || amt <= 0 || amt > 10000000) {
+        return { statusCode: 400, body: { error: "reportedAmount must be a positive dollar amount." } };
+      }
       // Derive homeownerId from the quote request server-side -- never trust client body
       let derivedHomeownerId = null;
       if (quoteRequestId) {
@@ -853,6 +857,10 @@ async function handleJobsRequest(body, req) {
       if (!contractorId) return { statusCode: 403, body: { error: "No contractor profile found for this account." } };
       if (!body.jobId || body.newAmount == null) {
         return { statusCode: 400, body: { error: "jobId and newAmount are required." } };
+      }
+      const newAmt = Number(body.newAmount);
+      if (!Number.isFinite(newAmt) || newAmt <= 0 || newAmt > 10000000) {
+        return { statusCode: 400, body: { error: "newAmount must be a positive dollar amount." } };
       }
       // Verify this job belongs to this contractor.
       const { data: job, error: jobError } = await supabase
