@@ -428,6 +428,15 @@ async function handleQuotesRequest(body, req) {
       if (!quoteRequestId || !status) {
         return { statusCode: 400, body: { error: "quoteRequestId and status are required." } };
       }
+      if (status !== "responded" && status !== "declined") {
+        return { statusCode: 400, body: { error: "status must be 'responded' or 'declined'." } };
+      }
+      if (status === "responded") {
+        const p = Number(price);
+        if (!Number.isFinite(p) || p <= 0 || p > 10000000) {
+          return { statusCode: 400, body: { error: "price must be a positive dollar amount." } };
+        }
+      }
       // contractorId comes from the verified session.
       const result = await respondToQuote(quoteRequestId, contractorId, status, price, message, body.lineItems || null);
       return { statusCode: 200, body: result };
