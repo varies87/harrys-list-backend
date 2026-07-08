@@ -320,6 +320,79 @@ const TRADES = [
   "Handyman",
 ];
 
+// ---------------------------------------------------------------------------
+// Slug helpers for programmatic trade x city SEO pages (/[trade]/[city]).
+// Slugs are lowercase, hyphenated, with "&"/"—"/"." stripped so URLs stay
+// clean (e.g. "Painting — Exterior" -> "painting-exterior",
+// "Landscaping & Lawn Care" -> "landscaping-lawn-care").
+// ---------------------------------------------------------------------------
+function slugify(str) {
+  return str
+    .toLowerCase()
+    .replace(/&/g, "and")
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+}
+
+// slug -> canonical trade name, built once from TRADES so every trade is
+// automatically reachable at /<slug> without hand-maintaining a map.
+const TRADE_SLUG_TO_NAME = new Map(TRADES.map((t) => [slugify(t), t]));
+
+// slug -> canonical city name, built from the same ZIP_DATA that powers the
+// service-area picker, so city coverage always matches what's real.
+const CITY_SLUG_TO_NAME = new Map(
+  [...INDEX.cityToZips.keys()].map((c) => [slugify(c), c])
+);
+
+function tradeSlug(tradeName) {
+  return slugify(tradeName);
+}
+function citySlug(cityName) {
+  return slugify(cityName);
+}
+function tradeNameFromSlug(slug) {
+  return TRADE_SLUG_TO_NAME.get(slug) || null;
+}
+function cityNameFromSlug(slug) {
+  return CITY_SLUG_TO_NAME.get(slug) || null;
+}
+
+/** Does this contractor's service area actually cover the given city? */
+function contractorCoversCity(contractor, cityName) {
+  if (contractor.serviceArea.mode === "ALL_DFW") return true;
+  const cityZips = INDEX.cityToZips.get(cityName);
+  if (!cityZips) return false;
+  const zips = contractor.serviceArea.zipCodes;
+  for (const z of cityZips) {
+    if (zips instanceof Set ? zips.has(z) : zips.includes(z)) return true;
+  }
+  return false;
+}
+
+/**
+ * Picks one representative city for a contractor's service area, for the
+ * "see other <trade> contractors in <city>" internal link on profile pages.
+ * ALL_DFW contractors link to Dallas (largest city); CUSTOM areas link to
+ * whichever covered city has the most of their selected zips.
+ */
+function primaryCityForServiceArea(serviceArea) {
+  if (!serviceArea) return null;
+  if (serviceArea.mode === "ALL_DFW") return "Dallas";
+  const zips = serviceArea.zipCodes;
+  const zipSet = zips instanceof Set ? zips : new Set(zips || []);
+  if (zipSet.size === 0) return null;
+  const counts = new Map();
+  zipSet.forEach((z) => {
+    const city = INDEX.zipToCity.get(z);
+    if (city) counts.set(city, (counts.get(city) || 0) + 1);
+  });
+  let best = null, bestCount = 0;
+  counts.forEach((count, city) => {
+    if (count > bestCount) { best = city; bestCount = count; }
+  });
+  return best;
+}
+
 function uid(prefix) {
   return `${prefix}_${Math.random().toString(36).slice(2, 9)}`;
 }
@@ -401,4 +474,11 @@ export {
   idsMatch,
   normalizeContractor,
   describeServiceArea,
+  slugify,
+  tradeSlug,
+  citySlug,
+  tradeNameFromSlug,
+  cityNameFromSlug,
+  contractorCoversCity,
+  primaryCityForServiceArea,
 };
