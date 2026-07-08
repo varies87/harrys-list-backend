@@ -1,302 +1,890 @@
-import dynamic from "next/dynamic";
-import Head from "next/head";
-import { useEffect, useState } from "react";
-import { supabaseAuth, apiCall } from "../shared";
+/**
+ * api/contractors.js
+ * ---------------------------------------------------------------------------
+ * Backend endpoint for everything contractor-related. Real auth: a
+ * contractor signs up against Supabase Auth directly from the frontend
+ * (public anon key, see shared.js), which issues a session token. That
+ * token is verified server-side here before any profile-editing action
+ * runs -- "create my profile," "update my profile," and "upload my logo"
+ * are all scoped to whoever the token proves you are, never to a
+ * contractorId the client simply sends in the request body.
+ *
+ * Public/admin-only routes (list, listPending, setStatus) are unchanged --
+ * those were never about "my own data" to begin with.
+ *
+ * Routes (distinguished by `action` in the request body):
+ *   POST /api/contractors  { action: "list" }                                   <- public, no auth needed
+ *   POST /api/contractors  { action: "foundingStatus" }                          <- public, no auth needed
+ *   POST /api/contractors  { action: "getMine" }                                <- auth required
+ *   POST /api/contractors  { action: "create", contractor: {...} }              <- auth required, creates MY profile
+ *   POST /api/contractors  { action: "update", updates: {...} }                 <- auth required, updates MY profile
+ *   POST /api/contractors  { action: "uploadLogo", fileBase64, fileName }       <- auth required, for MY profile
+ *   POST /api/contractors  { action: "uploadPortfolioPhoto", fileBase64, fileName, caption? }  <- auth required
+ *   POST /api/contractors  { action: "listPortfolioPhotos", contractorId }      <- public, no auth needed
+ *   POST /api/contractors  { action: "deletePortfolioPhoto", photoId }          <- auth required
+ *   POST /api/contractors  { action: "listPending", adminPassword }             <- admin only
+ *   POST /api/contractors  { action: "setStatus", adminPassword, contractorId, status }  <- admin only
+ *   POST /api/contractors  { action: "getWithReviews", contractorId }           <- public, no auth needed
+ *
+ * ENVIRONMENT VARIABLES
+ *   SUPABASE_URL
+ *   SUPABASE_SECRET_KEY
+ *   ADMIN_PASSWORD
+ * ---------------------------------------------------------------------------
+ */
 
-const ContractorApp = dynamic(() => import("../CustomerApp").then((mod) => mod.ContractorApp), { ssr: false });
+const { emailContractorApproved } = require("./email");
+const {
+  supabase,
+  toId,
+  getAuthedUser,
+  setCors,
+  checkAdminPassword,
+  rateLimit,
+  clientIp,
+  validateImageUpload,
+} = require("./_shared");
 
-export default function ContractorsPage() {
-  // A signed-in contractor should land on their dashboard, not scroll past the
-  // acquisition pitch they've already converted on. We render the hero by
-  // default (starting false keeps it in the SSR HTML for SEO and shows it
-  // instantly for logged-out ad traffic), then unmount it once an existing
-  // session is detected -- the app below then fills the screen with the
-  // dashboard. No scroll hack, no pitch flashing above a logged-in user.
-  const [signedIn, setSignedIn] = useState(false);
-  useEffect(() => {
-    let cancelled = false;
-    supabaseAuth.auth.getSession().then(({ data }) => {
-      if (!cancelled) setSignedIn(!!data?.session);
-    });
-    return () => { cancelled = true; };
-  }, []);
-
-  return (
-    <>
-      <Head>
-        <title>List Your Business Free — Harry's List DFW</title>
-        <meta
-          name="description"
-          content="Join Harry's List, the DFW trade directory with no pay-per-lead. List your business for free and only pay a small fee after a homeowner confirms a job is done."
-        />
-        {/* Open Graph / Twitter so the link preview (texts, social) shows the
-            Harry's List card instead of the Vercel default. Mirrors the
-            homepage tags but with contractor-facing copy. */}
-        <meta property="og:title" content="List your business free — Harry's List DFW" />
-        <meta property="og:description" content="No pay-per-lead. Join the DFW trade directory built on verified reviews — only pay a small fee after a homeowner confirms a job is done." />
-        <meta property="og:url" content="https://harryslistdfw.com/contractors" />
-        <meta property="og:type" content="website" />
-        <meta property="og:site_name" content="Harry's List" />
-        <meta property="og:image" content="https://harryslistdfw.com/og-image.png" />
-        <meta property="og:image:width" content="1254" />
-        <meta property="og:image:height" content="1254" />
-        <meta name="twitter:card" content="summary_large_image" />
-        <meta name="twitter:title" content="List your business free — Harry's List DFW" />
-        <meta name="twitter:description" content="No pay-per-lead. Join the DFW trade directory built on verified reviews." />
-        <meta name="twitter:image" content="https://harryslistdfw.com/og-image.png" />
-        {/* This page is landed on directly from contractor-targeted ads, unlike
-            most app-shell pages, so it's worth letting it be indexed/shared
-            rather than blocking it -- it now has real content, not just a
-            bare login form. */}
-      </Head>
-
-      {!signedIn && <ContractorHero />}
-
-      <div id="portal">
-        <ContractorApp />
-      </div>
-    </>
-  );
+function generateSlug(businessName) {
+  return businessName
+    .toLowerCase()
+    .trim()
+    .replace(/[^a-z0-9\s-]/g, "")
+    .replace(/\s+/g, "-")
+    .replace(/-+/g, "-");
 }
 
+function rowToContractor(row, reviews) {
+  return {
+    id: row.id,
+    slug: row.slug || null,
+    createdAt: row.created_at,
+    businessName: row.business_name,
+    trade: row.trade,
+    yearsInBusiness: row.years_in_business,
+    bio: row.bio,
+    licenseInfo: row.license_info,
+    email: row.email,
+    serviceArea: {
+      mode: row.service_area_mode,
+      zipCodes: row.service_area_zips ? row.service_area_zips.split(",").filter(Boolean) : [],
+    },
+    status: row.status,
+    isSuspended: !!row.is_suspended,
+    isFoundingMember: !!row.is_founding_member,
+    foundingFreeJobsUsed: row.founding_free_jobs_used || 0,
+    thumbsUp: row.thumbs_up_count || 0,
+    thumbsDown: row.thumbs_down || 0,
+    logoUrl: row.logo_url || null,
+    completedJobs: [],
+    reviews: reviews || [],
+  };
+}
+
+function contractorToRow(contractor) {
+  const row = {};
+  if (contractor.businessName !== undefined) row.business_name = contractor.businessName;
+  if (contractor.trade !== undefined) row.trade = contractor.trade;
+  if (contractor.yearsInBusiness !== undefined) row.years_in_business = contractor.yearsInBusiness;
+  if (contractor.bio !== undefined) row.bio = contractor.bio;
+  if (contractor.licenseInfo !== undefined) row.license_info = contractor.licenseInfo;
+  if (contractor.serviceArea !== undefined) {
+    row.service_area_mode = contractor.serviceArea.mode;
+    const zips = contractor.serviceArea.zipCodes;
+    row.service_area_zips = Array.isArray(zips) ? zips.join(",") : "";
+  }
+  // NOTE: `status` is intentionally NOT mapped here. It is an admin-only gate
+  // written directly by setContractorStatus / the create path. Mapping it here
+  // previously let a contractor self-approve via the "update" action (C-1).
+  if (contractor.logoUrl !== undefined) row.logo_url = contractor.logoUrl;
+  return row;
+}
+
+async function listContractors() {
+  const { data, error } = await supabase
+    .from("contractors")
+    .select("*")
+    .in("status", ["approved", "pending_review"])
+    .eq("is_suspended", false)
+    .order("created_at", { ascending: false });
+  if (error) throw new Error("Could not list contractors: " + error.message);
+  if (data.length === 0) return [];
+
+  // Fetch all reviews for listed contractors in one query
+  const contractorIds = data.map((c) => c.id);
+  const { data: reviewRows } = await supabase
+    .from("reviews")
+    .select("id, contractor_id, rating, text_review, created_at")
+    .in("contractor_id", contractorIds)
+    .order("created_at", { ascending: false });
+
+  // Group reviews by contractor
+  const reviewsByContractor = new Map();
+  (reviewRows || []).forEach((r) => {
+    if (!reviewsByContractor.has(r.contractor_id)) reviewsByContractor.set(r.contractor_id, []);
+    reviewsByContractor.get(r.contractor_id).push({
+      id: r.id,
+      rating: r.rating,
+      text: r.text_review || "",
+      createdAt: r.created_at,
+    });
+  });
+
+  return data.map((row) => rowToContractor(row, reviewsByContractor.get(row.id) || []));
+}
+
+async function listPendingContractors() {
+  const { data, error } = await supabase
+    .from("contractors")
+    .select("*")
+    .in("status", ["pending", "pending_review"])
+    .order("created_at", { ascending: false });
+  if (error) throw new Error("Could not list pending contractors: " + error.message);
+  return data.map((row) => rowToContractor(row));
+}
+
+// Admin auth (constant-time compare + durable rate limit) now lives in
+// ./_shared as checkAdminPassword. It is async, so call sites use `await`.
+
+async function findContractorByAuthId(authUserId) {
+  const { data, error } = await supabase
+    .from("contractors")
+    .select("*")
+    .eq("auth_user_id", authUserId)
+    .maybeSingle();
+  if (error) throw new Error("Could not look up contractor profile: " + error.message);
+  return data ? rowToContractor(data) : null;
+}
+
+async function createContractorForAuthUser(authUser, contractor) {
+  const existing = await findContractorByAuthId(authUser.id);
+  if (existing) {
+    throw new Error("You already have a contractor profile. Use 'update' to edit it.");
+  }
+
+  // Generate a unique slug from the business name
+  const baseSlug = generateSlug(contractor.businessName);
+  let slug = baseSlug;
+  let attempt = 0;
+  while (true) {
+    const { data: conflict } = await supabase
+      .from("contractors").select("id").eq("slug", slug).maybeSingle();
+    if (!conflict) break;
+    attempt++;
+    slug = `${baseSlug}-${attempt}`;
+  }
+
+  const row = {
+    ...contractorToRow(contractor),
+    auth_user_id: authUser.id,
+    email: authUser.email,
+    status: "pending",
+    slug,
+  };
+  const { data, error } = await supabase.from("contractors").insert(row).select().single();
+  if (error) throw new Error("Could not create contractor profile: " + error.message);
+  return rowToContractor(data);
+}
+
+// A contractor may only edit these fields on their own profile. `status`,
+// `is_suspended`, `slug`, `email`, `auth_user_id`, etc. are deliberately absent
+// so they can never be set through the self-service "update" action.
+const CONTRACTOR_EDITABLE_FIELDS = [
+  "businessName",
+  "trade",
+  "yearsInBusiness",
+  "bio",
+  "licenseInfo",
+  "serviceArea",
+  "logoUrl",
+];
+
+// Fields that, if edited AFTER a contractor is already approved, put the
+// listing back into the admin queue for a quick re-review -- these are the
+// free-text fields most worth a second look (business name, bio, license
+// claims). Portfolio photos and service area don't trigger this.
+const SENSITIVE_EDIT_FIELDS = ["businessName", "bio", "licenseInfo"];
+
+async function updateMyContractor(authUserId, updates) {
+  const safeUpdates = {};
+  for (const key of CONTRACTOR_EDITABLE_FIELDS) {
+    if (updates[key] !== undefined) safeUpdates[key] = updates[key];
+  }
+  const row = contractorToRow(safeUpdates);
+
+  const touchesSensitiveField = SENSITIVE_EDIT_FIELDS.some((key) => updates[key] !== undefined);
+  if (touchesSensitiveField) {
+    const { data: existing } = await supabase
+      .from("contractors").select("status").eq("auth_user_id", authUserId).maybeSingle();
+    // Only a currently-approved listing gets bumped back to re-review --
+    // a contractor still in the normal "pending" (first-time) queue, or
+    // already in "pending_review", just stays where they are.
+    if (existing?.status === "approved") {
+      row.status = "pending_review";
+    }
+  }
+
+  // Deliberately do NOT regenerate slug on business name change --
+  // the slug is set once at creation and never changes so existing
+  // shared links and QR codes keep working.
+  const { data, error } = await supabase
+    .from("contractors")
+    .update(row)
+    .eq("auth_user_id", authUserId)
+    .select()
+    .single();
+  if (error) throw new Error("Could not update contractor: " + error.message);
+  return rowToContractor(data);
+}
+
+// The Founding 50: the first 50 contractors to reach "approved" become
+// founding members (permanent badge + zero platform fee on their first job).
+const FOUNDING_MEMBER_CAP = 50;
+const FOUNDING_FREE_JOBS = 1;
+
+async function setContractorStatus(contractorId, status) {
+  // Fetch previous status + founding flag so we can detect first-time approval
+  const { data: existing } = await supabase
+    .from("contractors").select("status, is_founding_member").eq("id", toId(contractorId)).maybeSingle();
+  const previousStatus = existing?.status;
+
+  const updates = { status };
+
+  // On FIRST approval only, if there's still room under the cap, make them a
+  // founding member. Guarded so re-approvals (e.g. after a re-review) never
+  // re-trigger it, and so we never exceed 50.
+  if (status === "approved" && previousStatus !== "approved" && !existing?.is_founding_member) {
+    const { count } = await supabase
+      .from("contractors")
+      .select("id", { count: "exact", head: true })
+      .eq("is_founding_member", true);
+    if ((count || 0) < FOUNDING_MEMBER_CAP) {
+      updates.is_founding_member = true;
+    }
+  }
+
+  const { data, error } = await supabase
+    .from("contractors")
+    .update(updates)
+    .eq("id", toId(contractorId))
+    .select()
+    .single();
+  if (error) throw new Error("Could not update contractor status: " + error.message);
+  const contractor = rowToContractor(data);
+  contractor._previousStatus = previousStatus; // Pass through for email logic
+  return contractor;
+}
+
+const MAX_PORTFOLIO_PHOTOS = 20;
 
 /**
- * Visible contractor landing pitch shown above the sign-up/login app.
- * Contractor-targeted ads send people straight here (skipping the homepage),
- * so this leads with the fee model — the single most persuasive, concrete
- * thing about the product — then walks through the run-the-job tooling.
- * Framed for a pre-liquidity marketplace: it describes HOW requests work
- * ("when a homeowner wants a quote, it comes to you"), not a promise of lead
- * volume that can't yet be guaranteed.
+ * Uploads a portfolio photo to Supabase Storage and creates a row in
+ * portfolio_photos. Scoped to the current auth user's contractor profile --
+ * a contractor can only add photos to their own portfolio.
  */
-function ContractorHero() {
-  // Founding-offer gate. We read the live remaining-spots count only to decide
-  // whether the founding offer is still open -- we never display the number,
-  // because "47 left" reveals how few contractors are on yet and reads as
-  // plenty, killing the urgency. When spots run out (or the count can't load)
-  // this stays false and the hero renders exactly as the standard fee-led
-  // landing page -- so at 50 contractors it reverts automatically, no redeploy.
-  const [foundingActive, setFoundingActive] = useState(false);
-  useEffect(() => {
-    let cancelled = false;
-    apiCall("contractors", { action: "foundingStatus" })
-      .then((res) => {
-        if (!cancelled) setFoundingActive(typeof res?.spotsLeft === "number" && res.spotsLeft > 0);
-      })
-      .catch(() => {
-        if (!cancelled) setFoundingActive(false);
-      });
-    return () => { cancelled = true; };
-  }, []);
+async function uploadPortfolioPhoto(authUserId, fileBase64, fileName, contentType, caption, thumbnailBase64) {
+  const { data: contractor, error: lookupError } = await supabase
+    .from("contractors")
+    .select("id")
+    .eq("auth_user_id", authUserId)
+    .single();
+  if (lookupError || !contractor) throw new Error("You don't have a contractor profile yet.");
+  return addPortfolioPhotoForContractor(contractor.id, fileBase64, fileName, contentType, caption, thumbnailBase64);
+}
 
-  const scrollToPortal = (e) => {
-    e.preventDefault();
-    document.getElementById("portal")?.scrollIntoView({ behavior: "smooth" });
+// Shared by the contractor self-service path and the admin path. Adds a photo
+// to the given contractor's portfolio. The CALLER is responsible for
+// authorization (auth user lookup, or admin password check).
+async function addPortfolioPhotoForContractor(contractorId, fileBase64, fileName, contentType, caption, thumbnailBase64) {
+  const contractor = { id: toId(contractorId) };
+
+  const { count, error: countError } = await supabase
+    .from("portfolio_photos")
+    .select("id", { count: "exact", head: true })
+    .eq("contractor_id", contractor.id);
+  if (countError) throw new Error("Could not check photo count: " + countError.message);
+  if (count >= MAX_PORTFOLIO_PHOTOS) {
+    throw new Error(`Portfolio is full — maximum ${MAX_PORTFOLIO_PHOTOS} photos allowed. Delete some to add more.`);
+  }
+
+  // Verify the upload is a real image (PNG/JPEG/WebP) by its bytes -- not the
+  // client-declared content-type -- and use a sanitized filename. Rejects SVG
+  // and content-type confusion attacks.
+  const { buffer, contentType: safeType, safeName } = validateImageUpload(fileBase64, fileName);
+  const ts = Date.now();
+  const path = `${contractor.id}/${ts}-${safeName}`;
+
+  const { error: uploadError } = await supabase.storage
+    .from("portfolio-photos")
+    .upload(path, buffer, { contentType: safeType, upsert: false });
+  if (uploadError) throw new Error("Could not upload photo: " + uploadError.message);
+
+  const { data: urlData } = supabase.storage.from("portfolio-photos").getPublicUrl(path);
+
+  // Upload thumbnail if provided (also validated; skipped if not a valid image)
+  let thumbnailUrl = null;
+  if (thumbnailBase64) {
+    try {
+      const { buffer: thumbBuffer, contentType: thumbType } = validateImageUpload(
+        thumbnailBase64,
+        `thumb-${safeName}`
+      );
+      const thumbPath = `${contractor.id}/${ts}-thumb-${safeName}`;
+      const { error: thumbError } = await supabase.storage
+        .from("portfolio-photos")
+        .upload(thumbPath, thumbBuffer, { contentType: thumbType, upsert: false });
+      if (!thumbError) {
+        const { data: thumbUrlData } = supabase.storage.from("portfolio-photos").getPublicUrl(thumbPath);
+        thumbnailUrl = thumbUrlData.publicUrl;
+      }
+    } catch (_) {
+      /* invalid thumbnail -- skip it, keep the main photo */
+    }
+  }
+
+  const { data, error } = await supabase
+    .from("portfolio_photos")
+    .insert({
+      contractor_id: contractor.id,
+      storage_path: path,
+      public_url: urlData.publicUrl,
+      thumbnail_url: thumbnailUrl,
+      caption: caption || null,
+    })
+    .select()
+    .single();
+  if (error) throw new Error("Could not save photo record: " + error.message);
+
+  return rowToPhoto(data);
+}
+
+function rowToPhoto(row) {
+  return {
+    id: row.id,
+    contractorId: row.contractor_id,
+    publicUrl: row.public_url,
+    thumbnailUrl: row.thumbnail_url || row.public_url, // fall back to full if no thumb
+    caption: row.caption || null,
+    createdAt: row.created_at,
   };
+}
 
-  const features = [
-    {
-      icon: "ti-inbox",
-      title: "Requests come straight to you",
-      body: "When a homeowner in your service area wants a quote, it lands in your inbox — not auctioned off to five contractors bidding against each other for the same lead.",
+async function listPortfolioPhotos(contractorId) {
+  const { data, error } = await supabase
+    .from("portfolio_photos")
+    .select("*")
+    .eq("contractor_id", toId(contractorId))
+    .order("created_at", { ascending: false });
+  if (error) throw new Error("Could not list portfolio photos: " + error.message);
+  return data.map(rowToPhoto);
+}
+
+/**
+ * Deletes a portfolio photo -- verifies the photo belongs to the current
+ * auth user's contractor profile before deleting anything.
+ */
+async function deletePortfolioPhoto(authUserId, photoId) {
+  const { data: contractor, error: lookupError } = await supabase
+    .from("contractors")
+    .select("id")
+    .eq("auth_user_id", authUserId)
+    .single();
+  if (lookupError || !contractor) throw new Error("Contractor profile not found.");
+
+  const { data: photo, error: photoError } = await supabase
+    .from("portfolio_photos")
+    .select("id, contractor_id, storage_path")
+    .eq("id", toId(photoId))
+    .maybeSingle();
+  if (photoError) throw new Error("Could not find photo: " + photoError.message);
+  if (!photo) throw new Error("Photo not found.");
+  if (photo.contractor_id !== contractor.id) throw new Error("You can only delete your own photos.");
+
+  await supabase.storage.from("portfolio-photos").remove([photo.storage_path]);
+
+  const { error: deleteError } = await supabase
+    .from("portfolio_photos")
+    .delete()
+    .eq("id", toId(photoId));
+  if (deleteError) throw new Error("Could not delete photo record: " + deleteError.message);
+
+  return { deleted: true, photoId };
+}
+
+async function updatePortfolioPhotoCaption(authUserId, photoId, caption) {
+  const { data: contractor, error: lookupError } = await supabase
+    .from("contractors")
+    .select("id")
+    .eq("auth_user_id", authUserId)
+    .single();
+  if (lookupError || !contractor) throw new Error("Contractor profile not found.");
+
+  const { data: photo, error: photoError } = await supabase
+    .from("portfolio_photos")
+    .select("id, contractor_id")
+    .eq("id", toId(photoId))
+    .maybeSingle();
+  if (photoError) throw new Error("Could not find photo: " + photoError.message);
+  if (!photo) throw new Error("Photo not found.");
+  if (photo.contractor_id !== contractor.id) throw new Error("You can only edit your own photos.");
+
+  const { data, error } = await supabase
+    .from("portfolio_photos")
+    .update({ caption: caption || null })
+    .eq("id", toId(photoId))
+    .select()
+    .single();
+  if (error) throw new Error("Could not update caption: " + error.message);
+  return rowToPhoto(data);
+}
+
+
+
+async function getContractorWithReviews(contractorId) {
+  const cId = toId(contractorId);
+
+  const { data: row, error: rowError } = await supabase
+    .from("contractors")
+    .select("*")
+    .eq("id", cId)
+    .single();
+  if (rowError) throw new Error("Could not find contractor: " + rowError.message);
+
+  // Don't expose suspended or unapproved contractors on public profiles.
+  // pending_review is included here too -- it's an already-approved listing
+  // with a sensitive-field edit awaiting a quick admin look, and it stays
+  // live in the meantime (see updateMyContractor).
+  if ((row.status !== "approved" && row.status !== "pending_review") || row.is_suspended) {
+    throw new Error("This contractor profile is not publicly available.");
+  }
+
+  const { data: reviewRows, error: reviewsError } = await supabase
+    .from("reviews")
+    .select("*")
+    .eq("contractor_id", cId)
+    .order("created_at", { ascending: false });
+  if (reviewsError) throw new Error("Could not load reviews: " + reviewsError.message);
+
+  const reviews = (reviewRows || []).map((r) => ({
+    id: r.id,
+    contractorId: r.contractor_id,
+    homeownerId: r.homeowner_id,
+    jobId: r.job_id,
+    rating: r.rating,
+    text: r.text_review || "",
+    createdAt: r.created_at,
+  }));
+
+  return rowToContractor(row, reviews);
+}
+
+async function uploadLogoForAuthUser(authUserId, fileBase64, fileName, contentType) {
+  const { data: existing, error: lookupError } = await supabase
+    .from("contractors")
+    .select("id")
+    .eq("auth_user_id", authUserId)
+    .single();
+  if (lookupError || !existing) throw new Error("You don't have a contractor profile yet.");
+  return saveLogoForContractor(existing.id, fileBase64, fileName);
+}
+
+// Shared by the contractor self-service path and the admin path. The CALLER is
+// responsible for authorization.
+async function saveLogoForContractor(contractorId, fileBase64, fileName) {
+  const existing = { id: toId(contractorId) };
+  const { buffer, contentType: safeType, safeName } = validateImageUpload(fileBase64, fileName);
+  const path = `${existing.id}/${Date.now()}-${safeName}`;
+
+  const { error: uploadError } = await supabase.storage
+    .from("contractor-logos")
+    .upload(path, buffer, { contentType: safeType, upsert: true });
+  if (uploadError) throw new Error("Could not upload logo: " + uploadError.message);
+
+  const { data: publicUrlData } = supabase.storage.from("contractor-logos").getPublicUrl(path);
+  const logoUrl = publicUrlData.publicUrl;
+
+  const { data, error } = await supabase
+    .from("contractors")
+    .update({ logo_url: logoUrl })
+    .eq("id", existing.id)
+    .select()
+    .single();
+  if (error) throw new Error("Could not save logo URL: " + error.message);
+
+  return rowToContractor(data);
+}
+
+// ---------------------------------------------------------------------------
+// Admin-side edits. These let an admin (authenticated by the admin password,
+// checked at the call site) edit a contractor's profile and manage their
+// photos on their behalf -- for contractors who can't or won't do it
+// themselves. Each is keyed by contractorId, not auth_user_id.
+// ---------------------------------------------------------------------------
+async function adminUpdateContractor(contractorId, updates) {
+  const safeUpdates = {};
+  for (const key of CONTRACTOR_EDITABLE_FIELDS) {
+    if (updates[key] !== undefined) safeUpdates[key] = updates[key];
+  }
+  const row = contractorToRow(safeUpdates);
+  if (Object.keys(row).length === 0) throw new Error("No editable fields provided.");
+  const { data, error } = await supabase
+    .from("contractors")
+    .update(row)
+    .eq("id", toId(contractorId))
+    .select()
+    .single();
+  if (error) throw new Error("Could not update contractor: " + error.message);
+  return rowToContractor(data);
+}
+
+async function adminUploadLogo(contractorId, fileBase64, fileName) {
+  const { data: existing } = await supabase
+    .from("contractors").select("id").eq("id", toId(contractorId)).maybeSingle();
+  if (!existing) throw new Error("Contractor not found.");
+  return saveLogoForContractor(existing.id, fileBase64, fileName);
+}
+
+async function adminUploadPortfolioPhoto(contractorId, fileBase64, fileName, contentType, caption, thumbnailBase64) {
+  const { data: existing } = await supabase
+    .from("contractors").select("id").eq("id", toId(contractorId)).maybeSingle();
+  if (!existing) throw new Error("Contractor not found.");
+  return addPortfolioPhotoForContractor(existing.id, fileBase64, fileName, contentType, caption, thumbnailBase64);
+}
+
+async function adminDeletePortfolioPhoto(photoId) {
+  const { data: photo, error: photoError } = await supabase
+    .from("portfolio_photos").select("id, storage_path").eq("id", toId(photoId)).maybeSingle();
+  if (photoError) throw new Error("Could not find photo: " + photoError.message);
+  if (!photo) throw new Error("Photo not found.");
+  await supabase.storage.from("portfolio-photos").remove([photo.storage_path]);
+  const { error: deleteError } = await supabase
+    .from("portfolio_photos").delete().eq("id", toId(photoId));
+  if (deleteError) throw new Error("Could not delete photo record: " + deleteError.message);
+  return { deleted: true, photoId };
+}
+
+async function handleContractorsRequest(body, req) {
+  const { action } = body || {};
+
+  try {
+    if (action === "list") {
+      const contractors = await listContractors();
+      return { statusCode: 200, body: { contractors } };
+    }
+
+    if (action === "foundingStatus") {
+      // Public: how many "Founding 50" spots remain. Drives the landing-page
+      // offer banner. Counts is_founding_member=true -- the SAME source
+      // setContractorStatus uses to cap the perk -- so the banner and the
+      // actual benefit switch off together the moment the 50th founder is
+      // approved. No auth: it exposes only an aggregate count.
+      const { count } = await supabase
+        .from("contractors")
+        .select("id", { count: "exact", head: true })
+        .eq("is_founding_member", true);
+      const founderCount = count || 0;
+      return {
+        statusCode: 200,
+        body: {
+          founderCount,
+          spotsLeft: Math.max(0, FOUNDING_MEMBER_CAP - founderCount),
+          cap: FOUNDING_MEMBER_CAP,
+          freeJobs: FOUNDING_FREE_JOBS,
+        },
+      };
+    }
+
+    if (action === "getWithReviews") {
+      // Accepts either contractorId (numeric) or slug (string)
+      const { contractorId, slug } = body;
+      if (!contractorId && !slug) {
+        return { statusCode: 400, body: { error: "contractorId or slug is required." } };
+      }
+      let lookupId = contractorId;
+      if (!lookupId && slug) {
+        // Look up id by slug
+        const { data: row, error: slugError } = await supabase
+          .from("contractors").select("id").eq("slug", slug).maybeSingle();
+        if (slugError || !row) return { statusCode: 404, body: { error: "Contractor not found." } };
+        lookupId = row.id;
+      }
+      const contractor = await getContractorWithReviews(lookupId);
+      return { statusCode: 200, body: { contractor } };
+    }
+
+    if (action === "listPortfolioPhotos") {
+      const { contractorId, slug } = body;
+      if (!contractorId && !slug) {
+        return { statusCode: 400, body: { error: "contractorId or slug is required." } };
+      }
+      let lookupId = contractorId;
+      if (!lookupId && slug) {
+        const { data: row } = await supabase.from("contractors").select("id").eq("slug", slug).maybeSingle();
+        if (!row) return { statusCode: 404, body: { error: "Contractor not found." } };
+        lookupId = row.id;
+      }
+      const photos = await listPortfolioPhotos(lookupId);
+      return { statusCode: 200, body: { photos } };
+    }
+
+    if (action === "listApproved") {
+      try {
+        if (!(await checkAdminPassword(body.adminPassword, req))) {
+          return { statusCode: 401, body: { error: "Incorrect admin password." } };
+        }
+      } catch (err) {
+        return { statusCode: 429, body: { error: err.message } };
+      }
+      const { data, error } = await supabase
+        .from("contractors")
+        .select("*")
+        .eq("status", "approved")
+        .order("created_at", { ascending: false });
+      if (error) throw new Error(error.message);
+      return { statusCode: 200, body: { contractors: (data || []).map((r) => rowToContractor(r)) } };
+    }
+
+    if (action === "listArchived") {
+      try {
+        if (!(await checkAdminPassword(body.adminPassword, req))) {
+          return { statusCode: 401, body: { error: "Incorrect admin password." } };
+        }
+      } catch (err) {
+        return { statusCode: 429, body: { error: err.message } };
+      }
+      const { data, error } = await supabase
+        .from("contractors")
+        .select("*")
+        .eq("status", "archived")
+        .order("created_at", { ascending: false });
+      if (error) throw new Error(error.message);
+      return { statusCode: 200, body: { contractors: (data || []).map((r) => rowToContractor(r)) } };
+    }
+
+    if (action === "listPending") {
+      try {
+        if (!(await checkAdminPassword(body.adminPassword, req))) {
+          return { statusCode: 401, body: { error: "Incorrect admin password." } };
+        }
+      } catch (err) {
+        return { statusCode: 429, body: { error: err.message } };
+      }
+      const contractors = await listPendingContractors();
+      return { statusCode: 200, body: { contractors } };
+    }
+
+    if (action === "setStatus") {
+      try {
+        if (!(await checkAdminPassword(body.adminPassword, req))) {
+          return { statusCode: 401, body: { error: "Incorrect admin password." } };
+        }
+      } catch (err) {
+        return { statusCode: 429, body: { error: err.message } };
+      }
+      if (!body.contractorId || !body.status) {
+        return { statusCode: 400, body: { error: "contractorId and status are required." } };
+      }
+      if (body.status !== "approved" && body.status !== "rejected" && body.status !== "archived") {
+        return { statusCode: 400, body: { error: "status must be 'approved', 'rejected', or 'archived'." } };
+      }
+      const contractor = await setContractorStatus(body.contractorId, body.status);
+      // Email contractor on first approval only (not re-approval)
+      if (body.status === "approved" && contractor._previousStatus !== "approved" && contractor.email) {
+        emailContractorApproved({
+          contractorEmail: contractor.email,
+          contractorName: contractor.businessName,
+        }).catch(() => {});
+      }
+      return { statusCode: 200, body: { contractor } };
+    }
+
+    if (action === "adminUpdateContractor") {
+      try {
+        if (!(await checkAdminPassword(body.adminPassword, req))) {
+          return { statusCode: 401, body: { error: "Incorrect admin password." } };
+        }
+      } catch (err) {
+        return { statusCode: 429, body: { error: err.message } };
+      }
+      if (!body.contractorId || !body.updates) {
+        return { statusCode: 400, body: { error: "contractorId and updates are required." } };
+      }
+      if (body.updates.businessName && body.updates.businessName.length > 100) {
+        return { statusCode: 400, body: { error: "Business name must be 100 characters or less." } };
+      }
+      if (body.updates.bio && body.updates.bio.length > 2000) {
+        return { statusCode: 400, body: { error: "Bio must be 2000 characters or less." } };
+      }
+      const contractor = await adminUpdateContractor(body.contractorId, body.updates);
+      return { statusCode: 200, body: { contractor } };
+    }
+
+    if (action === "adminUploadLogo") {
+      try {
+        if (!(await checkAdminPassword(body.adminPassword, req))) {
+          return { statusCode: 401, body: { error: "Incorrect admin password." } };
+        }
+      } catch (err) {
+        return { statusCode: 429, body: { error: err.message } };
+      }
+      if (!body.contractorId || !body.fileBase64 || !body.fileName) {
+        return { statusCode: 400, body: { error: "contractorId, fileBase64 and fileName are required." } };
+      }
+      const contractor = await adminUploadLogo(body.contractorId, body.fileBase64, body.fileName);
+      return { statusCode: 200, body: { contractor } };
+    }
+
+    if (action === "adminUploadPortfolioPhoto") {
+      try {
+        if (!(await checkAdminPassword(body.adminPassword, req))) {
+          return { statusCode: 401, body: { error: "Incorrect admin password." } };
+        }
+      } catch (err) {
+        return { statusCode: 429, body: { error: err.message } };
+      }
+      if (!body.contractorId || !body.fileBase64 || !body.fileName) {
+        return { statusCode: 400, body: { error: "contractorId, fileBase64 and fileName are required." } };
+      }
+      const photo = await adminUploadPortfolioPhoto(
+        body.contractorId,
+        body.fileBase64,
+        body.fileName,
+        body.contentType || "image/jpeg",
+        body.caption || null,
+        body.thumbnailBase64 || null
+      );
+      return { statusCode: 200, body: { photo } };
+    }
+
+    if (action === "adminDeletePortfolioPhoto") {
+      try {
+        if (!(await checkAdminPassword(body.adminPassword, req))) {
+          return { statusCode: 401, body: { error: "Incorrect admin password." } };
+        }
+      } catch (err) {
+        return { statusCode: 429, body: { error: err.message } };
+      }
+      if (!body.photoId) {
+        return { statusCode: 400, body: { error: "photoId is required." } };
+      }
+      const result = await adminDeletePortfolioPhoto(body.photoId);
+      return { statusCode: 200, body: result };
+    }
+
+    const authUser = await getAuthedUser(req);
+    if (!authUser) {
+      return { statusCode: 401, body: { error: "You must be signed in." } };
+    }
+
+    if (action === "getMine") {
+      const contractor = await findContractorByAuthId(authUser.id);
+      return { statusCode: 200, body: { contractor } };
+    }
+
+    if (action === "create") {
+      if (!body.contractor || !body.contractor.businessName) {
+        return { statusCode: 400, body: { error: "contractor.businessName is required." } };
+      }
+      if (body.contractor.businessName.length > 100) {
+        return { statusCode: 400, body: { error: "Business name must be 100 characters or less." } };
+      }
+      if (body.contractor.bio && body.contractor.bio.length > 2000) {
+        return { statusCode: 400, body: { error: "Bio must be 2000 characters or less." } };
+      }
+      if (!(await rateLimit(`contractor-create:${clientIp(req)}`, { max: 5, windowMs: 60 * 60 * 1000 }))) {
+        return { statusCode: 429, body: { error: "Too many requests. Please try again later." } };
+      }
+      const contractor = await createContractorForAuthUser(authUser, body.contractor);
+      return { statusCode: 200, body: { contractor } };
+    }
+
+    if (action === "update") {
+      const updates = body.updates || {};
+      if (updates.businessName && updates.businessName.length > 100) {
+        return { statusCode: 400, body: { error: "Business name must be 100 characters or less." } };
+      }
+      if (updates.bio && updates.bio.length > 2000) {
+        return { statusCode: 400, body: { error: "Bio must be 2000 characters or less." } };
+      }
+      const contractor = await updateMyContractor(authUser.id, updates);
+      return { statusCode: 200, body: { contractor } };
+    }
+
+    if (action === "uploadLogo") {
+      if (!body.fileBase64 || !body.fileName) {
+        return { statusCode: 400, body: { error: "fileBase64 and fileName are required." } };
+      }
+      const contractor = await uploadLogoForAuthUser(
+        authUser.id,
+        body.fileBase64,
+        body.fileName,
+        body.contentType || "image/png"
+      );
+      return { statusCode: 200, body: { contractor } };
+    }
+
+    if (action === "uploadPortfolioPhoto") {
+      if (!body.fileBase64 || !body.fileName) {
+        return { statusCode: 400, body: { error: "fileBase64 and fileName are required." } };
+      }
+      const photo = await uploadPortfolioPhoto(
+        authUser.id,
+        body.fileBase64,
+        body.fileName,
+        body.contentType || "image/jpeg",
+        body.caption || null,
+        body.thumbnailBase64 || null
+      );
+      return { statusCode: 200, body: { photo } };
+    }
+
+    if (action === "deletePortfolioPhoto") {
+      if (!body.photoId) {
+        return { statusCode: 400, body: { error: "photoId is required." } };
+      }
+      const result = await deletePortfolioPhoto(authUser.id, body.photoId);
+      return { statusCode: 200, body: result };
+    }
+
+    if (action === "updatePhotoCaption") {
+      if (!body.photoId) {
+        return { statusCode: 400, body: { error: "photoId is required." } };
+      }
+      const photo = await updatePortfolioPhotoCaption(authUser.id, body.photoId, body.caption || null);
+      return { statusCode: 200, body: { photo } };
+    }
+
+    return { statusCode: 400, body: { error: `Unknown action: ${action}` } };
+  } catch (err) {
+    console.error("contractors handler error:", err);
+    return { statusCode: 500, body: { error: err.message } };
+  }
+}
+
+module.exports = async function handler(req, res) {
+  setCors(req, res);
+
+  if (req.method === "OPTIONS") {
+    res.status(200).end();
+    return;
+  }
+
+  if (req.method !== "POST") {
+    res.status(405).json({ error: "Method not allowed" });
+    return;
+  }
+  const result = await handleContractorsRequest(req.body, req);
+  res.status(result.statusCode).json(result.body);
+};
+
+module.exports.config = {
+  api: {
+    bodyParser: {
+      sizeLimit: "4.5mb",
     },
-    {
-      icon: "ti-map-pin",
-      title: "You pick your service area",
-      body: "Choose the exact DFW zip codes you cover, so you only hear from homeowners you can actually serve.",
-    },
-    {
-      icon: "ti-file-invoice",
-      title: "Quote and invoice in-app",
-      body: "Build itemized quotes and invoices with line items, then send a clean, printable version. The invoice even pre-fills from your original quote.",
-    },
-    {
-      icon: "ti-star",
-      title: "Reviews that can't be faked",
-      body: "Ratings come only from real, completed jobs — so a strong reputation actually means something, and nobody can buy their way above you in search.",
-    },
-    {
-      icon: "ti-qrcode",
-      title: "Bring your own customers too",
-      body: "Get a free profile page and a QR code to put on business cards, your truck, or your Instagram — a way to collect reviews from the jobs you already have.",
-    },
-  ];
+  },
+};
 
-  return (
-    <div className="cl-landing">
-      <style>{CONTRACTOR_LANDING_STYLES}</style>
-
-      <section className="cl-hero">
-        <div className="cl-hero-inner">
-          {foundingActive && (
-            <div className="cl-founding-strip">
-              <span className="cl-founding-strip-badge">★ First Fifty</span>
-              <span className="cl-founding-strip-text">
-                Founding offer: your first completed job's platform fee is on us. First 50 DFW contractors only.
-              </span>
-            </div>
-          )}
-          <span className="cl-eyebrow">For DFW contractors</span>
-          <h1 className="cl-h1">Keep 96 to 99% of every job.</h1>
-          <p className="cl-sub">
-            No pay-per-lead. No monthly fee. No cost to list. You pay one small percentage
-            only after a homeowner confirms the job is done.
-          </p>
-          <a href="#portal" className="cl-btn cl-btn-primary cl-btn-lg" onClick={scrollToPortal}>
-            List your business free →
-          </a>
-        </div>
-      </section>
-
-      <section className="cl-section">
-        <div className="cl-fee-grid">
-          <div className="cl-fee-tile">
-            <div className="cl-fee-pct">4%</div>
-            <div className="cl-fee-label">under $500</div>
-          </div>
-          <div className="cl-fee-tile">
-            <div className="cl-fee-pct">3%</div>
-            <div className="cl-fee-label">to $2,500</div>
-          </div>
-          <div className="cl-fee-tile">
-            <div className="cl-fee-pct">2%</div>
-            <div className="cl-fee-label">to $10,000</div>
-          </div>
-          <div className="cl-fee-tile cl-fee-tile-dark">
-            <div className="cl-fee-pct">1%</div>
-            <div className="cl-fee-label">$10,000+</div>
-          </div>
-        </div>
-        <p className="cl-fee-note">
-          The bigger the job, the smaller the cut. A $4,000 job costs you $80 — and only
-          after you've been paid for it.
-        </p>
-      </section>
-
-      <section className="cl-section">
-        <h2 className="cl-h2">Why contractors join</h2>
-        <div className="cl-features">
-          {features.map((f) => (
-            <div className="cl-feature" key={f.title}>
-              <div className="cl-feature-icon" aria-hidden="true">
-                <i className={`ti ${f.icon}`} />
-              </div>
-              <div>
-                <div className="cl-feature-title">{f.title}</div>
-                <p className="cl-feature-body">{f.body}</p>
-              </div>
-            </div>
-          ))}
-        </div>
-      </section>
-
-      <section className="cl-section cl-closer-wrap">
-        <div className="cl-closer">
-          <div className="cl-closer-title">Free to join. Free to list. Free to quote.</div>
-          <p className="cl-closer-sub">You only ever pay after you've been paid for a completed job.</p>
-          <a href="#portal" className="cl-btn cl-btn-primary cl-btn-lg" onClick={scrollToPortal}>
-            List your business today →
-          </a>
-        </div>
-      </section>
-    </div>
-  );
-}
-
-const CONTRACTOR_LANDING_STYLES = `
-.cl-landing {
-  --cl-bg: #FBF7F0;
-  --cl-surface: #FFFFFF;
-  --cl-ink: #1C2B22;
-  --cl-ink-soft: #3D4F42;
-  --cl-clay: #C1622A;
-  --cl-clay-dark: #A8511F;
-  --cl-clay-tint: #FBE9DD;
-  --cl-clay-text: #993C1D;
-  --cl-sand: #F7F1E7;
-  --cl-sand-text: #6B5840;
-  --cl-sand-line: #EDE3D2;
-  --cl-gold: #E8A33D;
-  --cl-serif: "Iowan Old Style", "Palatino Linotype", "Book Antiqua", Georgia, "Times New Roman", serif;
-  --cl-sans: -apple-system, BlinkMacSystemFont, "Inter", "Segoe UI", Helvetica, Arial, sans-serif;
-  font-family: var(--cl-sans);
-  color: var(--cl-ink);
-  background: var(--cl-bg);
-}
-.cl-hero {
-  background: var(--cl-ink);
-  background-image: linear-gradient(165deg, #20342a 0%, var(--cl-ink) 60%);
-  color: var(--cl-bg);
-  padding: 60px 24px 52px;
-  text-align: center;
-}
-.cl-hero-inner { max-width: 620px; margin: 0 auto; }
-.cl-eyebrow {
-  display: inline-block; font-size: 12px; font-weight: 700; letter-spacing: 0.06em;
-  text-transform: uppercase; color: var(--cl-gold); margin-bottom: 16px;
-}
-.cl-founding-strip {
-  display: flex; gap: 11px; align-items: center; justify-content: center; flex-wrap: wrap;
-  background: linear-gradient(135deg, #E8A33D 0%, #C8872A 100%);
-  border-radius: 12px; padding: 12px 18px; margin: 0 auto 24px; max-width: 560px;
-  box-shadow: 0 3px 14px rgba(232,163,61,0.25);
-}
-.cl-founding-strip-badge {
-  background: rgba(28,43,34,0.85); color: #FBE9C6; font-weight: 700; font-size: 11px;
-  letter-spacing: 0.04em; white-space: nowrap; padding: 5px 11px; border-radius: 999px;
-}
-.cl-founding-strip-text {
-  font-size: 14px; font-weight: 600; line-height: 1.4; color: #241704; text-align: left;
-}
-.cl-h1 {
-  font-family: var(--cl-serif); font-size: clamp(30px, 5vw, 42px); line-height: 1.12;
-  font-weight: 600; margin: 0 0 16px; color: #FDFBF6;
-}
-.cl-sub {
-  font-size: 16.5px; line-height: 1.6; color: #D9E2DB; max-width: 500px; margin: 0 auto 26px;
-}
-.cl-btn {
-  display: inline-block; padding: 13px 26px; border-radius: 8px; font-weight: 700;
-  font-size: 15px; text-decoration: none; transition: transform 0.15s ease, background 0.15s ease;
-}
-.cl-btn-lg { padding: 16px 34px; font-size: 17px; border-radius: 10px; }
-.cl-btn-primary { background: var(--cl-clay); color: #fff; }
-.cl-btn-primary:hover { background: var(--cl-clay-dark); transform: translateY(-1px); }
-.cl-section { max-width: 720px; margin: 0 auto; padding: 40px 24px 0; }
-.cl-fee-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; }
-.cl-fee-tile {
-  background: var(--cl-sand); border-radius: 12px; padding: 18px 8px; text-align: center;
-}
-.cl-fee-tile-dark { background: var(--cl-ink); }
-.cl-fee-pct { font-size: 28px; font-weight: 700; color: var(--cl-ink); font-family: var(--cl-serif); }
-.cl-fee-tile-dark .cl-fee-pct { color: var(--cl-gold); }
-.cl-fee-label { font-size: 12px; color: var(--cl-sand-text); margin-top: 4px; }
-.cl-fee-tile-dark .cl-fee-label { color: #B8C4BB; }
-.cl-fee-note { text-align: center; font-size: 13.5px; color: var(--cl-ink-soft); margin: 14px 0 0; }
-.cl-h2 {
-  font-family: var(--cl-serif); font-size: 24px; font-weight: 600; margin: 0 0 20px; color: var(--cl-ink);
-}
-.cl-features { display: flex; flex-direction: column; gap: 12px; }
-.cl-feature {
-  background: var(--cl-surface); border: 1px solid var(--cl-sand-line); border-radius: 14px;
-  padding: 18px 20px; display: flex; gap: 16px; align-items: flex-start;
-}
-.cl-feature-icon {
-  width: 40px; height: 40px; border-radius: 10px; background: var(--cl-clay-tint);
-  color: var(--cl-clay-text); display: flex; align-items: center; justify-content: center;
-  font-size: 21px; flex-shrink: 0;
-}
-.cl-feature-title { font-weight: 700; font-size: 15.5px; color: var(--cl-ink); margin-bottom: 4px; }
-.cl-feature-body { margin: 0; font-size: 14px; color: var(--cl-ink-soft); line-height: 1.55; }
-.cl-closer-wrap { padding-bottom: 12px; }
-.cl-closer {
-  background: var(--cl-ink); border-radius: 16px; padding: 32px 24px; text-align: center;
-}
-.cl-closer-title { font-family: var(--cl-serif); font-size: 21px; font-weight: 600; color: #FDFBF6; margin-bottom: 6px; }
-.cl-closer-sub { font-size: 14px; color: #B8C4BB; margin: 0 0 20px; }
-@media (max-width: 620px) {
-  .cl-fee-grid { grid-template-columns: repeat(2, 1fr); }
-  .cl-hero { padding: 48px 20px 40px; }
-  .cl-feature { padding: 16px; }
-}
-`;
+module.exports.handleContractorsRequest = handleContractorsRequest;
+module.exports.rowToContractor = rowToContractor;
+module.exports.contractorToRow = contractorToRow;
