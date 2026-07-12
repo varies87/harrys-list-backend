@@ -174,7 +174,15 @@ async function handleCreatePaymentIntent(body, req) {
         },
       },
       {
-        idempotencyKey: `fee_${jobId}`,
+        // Keyed on job ID AND the fee amount (in cents), not job ID alone.
+        // A bare job-ID key permanently locks in whatever parameters were
+        // used on the very first attempt -- if the code (or the invoice
+        // amount) ever changes before a retry, Stripe correctly rejects the
+        // mismatched replay with a StripeIdempotencyError. Tying the key to
+        // the amount too means a genuinely different charge naturally gets
+        // a fresh key, while still preventing true accidental duplicates
+        // (same job, same amount, same request) from double-charging.
+        idempotencyKey: `fee_${jobId}_${amountInCents}`,
       }
     );
 
