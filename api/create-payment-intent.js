@@ -157,7 +157,15 @@ async function handleCreatePaymentIntent(body, req) {
       {
         amount: amountInCents,
         currency: "usd",
-        automatic_payment_methods: { enabled: true },
+        // Restricted to card only (not automatic_payment_methods) so this
+        // never depends on Stripe's live-mode domain registration step for
+        // wallet methods (Apple Pay/Google Pay/Link) -- cards need zero
+        // extra setup and cover the vast majority of real transactions.
+        // Once harryslistdfw.com is registered as a payment method domain
+        // in Stripe (Live mode -> Settings -> Payment methods -> Domains),
+        // this can switch back to automatic_payment_methods to add those
+        // wallet options.
+        payment_method_types: ["card"],
         metadata: {
           jobId,
           contractorId,
