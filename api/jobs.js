@@ -356,10 +356,24 @@ async function listLowReportContractors() {
  * used on the original report, since an edited amount could newly trip
  * (or newly clear) that threshold against the original quote.
  */
+async function getJobAmountHistory(jobId) {
+  const { data, error } = await supabase
+    .from("job_amount_revisions")
+    .select("amount, note, superseded_at")
+    .eq("job_id", toId(jobId))
+    .order("superseded_at", { ascending: true });
+  if (error) throw new Error("Could not load invoice history: " + error.message);
+  return (data || []).map((r) => ({
+    amount: Number(r.amount),
+    note: r.note || null,
+    supersededAt: r.superseded_at,
+  }));
+}
+
 async function editReportedAmount(jobId, newAmount, lowReportReason) {
   const { data: existing, error: lookupError } = await supabase
     .from("completed_jobs")
-    .select("id, status, quoted_amount")
+    .select("id, status, quoted_amount, reported_amount, dispute_note")
     .eq("id", toId(jobId))
     .maybeSingle();
   if (lookupError) throw new Error("Could not look up job: " + lookupError.message);
@@ -374,6 +388,15 @@ async function editReportedAmount(jobId, newAmount, lowReportReason) {
     throw new Error(
       "The corrected amount is more than 10% below your original quote. Please provide a reason."
     );
+  }
+
+  if (existing.reported_amount != null) {
+    const { error: historyError } = await supabase.from("job_amount_revisions").insert({
+      job_id: toId(jobId),
+      amount: existing.reported_amount,
+      note: existing.dispute_note || null,
+    });
+    if (historyError) throw new Error("Could not save invoice history: " + historyError.message);
   }
 
   const { data, error } = await supabase
@@ -851,6 +874,12 @@ async function handleJobsRequest(body, req) {
       }
       const disputed = await disputeJob(body.jobId, body.note);
       return { statusCode: 200, body: { job: disputed } };
+    }
+
+    if (action === "getJobAmountHistory") {
+      if (!body.jobId) return { statusCode: 400, body: { error: "jobId is required." } };
+      const revisions = await getJobAmountHistory(body.jobId);
+      return { statusCode: 200, body: { revisions } };
     }
 
     if (action === "editReportedAmount") {
