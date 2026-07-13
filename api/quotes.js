@@ -50,6 +50,15 @@ function rowToRecipient(row) {
             lineItems: row.quote_line_items || null,
           }
         : undefined,
+    draft:
+      row.draft_price != null || row.draft_message || row.draft_line_items
+        ? {
+            price: row.draft_price != null ? Number(row.draft_price) : null,
+            message: row.draft_message || "",
+            lineItems: row.draft_line_items || null,
+            updatedAt: row.draft_updated_at || null,
+          }
+        : undefined,
   };
 }
 
@@ -197,19 +206,76 @@ async function attachRecipients(requests) {
   );
 }
 
-async function respondToQuote(quoteRequestId, contractorId, status, price, message, lineItems) {
-  // Only allow responding if currently in 'sent' status
-  // Prevents un-declining or overwriting an existing quote
+async function saveQuoteDraft(quoteRequestId, contractorId, price, message, lineItems) {
   const { data: existing } = await supabase
     .from("quote_recipients")
-    .select("status")
+    .select("status, homeowner_accepted")
+    .eq("quote_request_id", toId(quoteRequestId))
+    .eq("contractor_id", toId(contractorId))
+    .maybeSingle();
+  if (!existing) throw new Error("Quote recipient not found.");
+  if (existing.status === "declined") throw new Error("This quote request was already declined.");
+  if (existing.homeowner_accepted) throw new Error("This quote has already been accepted and can no longer be edited.");
+
+  const { error } = await supabase
+    .from("quote_recipients")
+    .update({
+      draft_price: price != null ? price : null,
+      draft_message: message || null,
+      draft_line_items: lineItems && lineItems.length > 0 ? lineItems : null,
+      draft_updated_at: new Date().toISOString(),
+    })
+    .eq("quote_request_id", toId(quoteRequestId))
+    .eq("contractor_id", toId(contractorId));
+  if (error) throw new Error("Could not save draft: " + error.message);
+}
+
+async function getQuoteHistory(quoteRequestId, contractorId) {
+  const { data, error } = await supabase
+    .from("quote_revisions")
+    .select("price, message, line_items, superseded_at")
+    .eq("quote_request_id", toId(quoteRequestId))
+    .eq("contractor_id", toId(contractorId))
+    .order("superseded_at", { ascending: true });
+  if (error) throw new Error("Could not load quote history: " + error.message);
+  return (data || []).map((r) => ({
+    price: Number(r.price),
+    message: r.message || "",
+    lineItems: r.line_items || null,
+    supersededAt: r.superseded_at,
+  }));
+}
+
+async function respondToQuote(quoteRequestId, contractorId, status, price, message, lineItems) {
+  const { data: existing } = await supabase
+    .from("quote_recipients")
+    .select("status, homeowner_accepted, quote_price, quote_message, quote_line_items")
     .eq("quote_request_id", toId(quoteRequestId))
     .eq("contractor_id", toId(contractorId))
     .maybeSingle();
 
   if (!existing) throw new Error("Quote recipient not found.");
-  if (existing.status !== "sent") {
-    throw new Error("This quote request has already been responded to or declined.");
+
+  const isRevision = existing.status === "responded" && status === "responded";
+  if (existing.status === "declined") {
+    throw new Error("This quote request has already been declined.");
+  }
+  if (existing.status === "responded" && !isRevision) {
+    throw new Error("This quote request has already been responded to.");
+  }
+  if (isRevision && existing.homeowner_accepted) {
+    throw new Error("The homeowner has already accepted this quote -- it can no longer be revised.");
+  }
+
+  if (isRevision && existing.quote_price != null) {
+    const { error: historyError } = await supabase.from("quote_revisions").insert({
+      quote_request_id: toId(quoteRequestId),
+      contractor_id: toId(contractorId),
+      price: existing.quote_price,
+      message: existing.quote_message,
+      line_items: existing.quote_line_items,
+    });
+    if (historyError) throw new Error("Could not save quote history: " + historyError.message);
   }
 
   const updates = { status };
@@ -219,6 +285,10 @@ async function respondToQuote(quoteRequestId, contractorId, status, price, messa
     if (lineItems && lineItems.length > 0) {
       updates.quote_line_items = lineItems;
     }
+    updates.draft_price = null;
+    updates.draft_message = null;
+    updates.draft_line_items = null;
+    updates.draft_updated_at = null;
   }
 
   const { error } = await supabase
@@ -420,6 +490,23 @@ async function handleQuotesRequest(body, req) {
       if (!contractorId) return { statusCode: 403, body: { error: "No contractor profile found for this account." } };
       const quoteRequests = await listQuoteRequestsForContractor(contractorId);
       return { statusCode: 200, body: { quoteRequests } };
+    }
+
+    if (action === "saveDraft") {
+      if (!contractorId) return { statusCode: 403, body: { error: "No contractor profile found for this account." } };
+      const { quoteRequestId, price, message, lineItems } = body;
+      if (!quoteRequestId) return { statusCode: 400, body: { error: "quoteRequestId is required." } };
+      await saveQuoteDraft(quoteRequestId, contractorId, price, message, lineItems);
+      return { statusCode: 200, body: { saved: true } };
+    }
+
+    if (action === "getQuoteHistory") {
+      const { quoteRequestId, contractorId: forContractorId } = body;
+      if (!quoteRequestId || !forContractorId) {
+        return { statusCode: 400, body: { error: "quoteRequestId and contractorId are required." } };
+      }
+      const revisions = await getQuoteHistory(quoteRequestId, forContractorId);
+      return { statusCode: 200, body: { revisions } };
     }
 
     if (action === "respond") {
