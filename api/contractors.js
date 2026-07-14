@@ -153,7 +153,30 @@ async function findContractorByAuthId(authUserId) {
     .eq("auth_user_id", authUserId)
     .maybeSingle();
   if (error) throw new Error("Could not look up contractor profile: " + error.message);
-  return data ? rowToContractor(data) : null;
+  if (!data) return null;
+
+  // Attach the contractor's own reviews to their own dashboard view. Unlike
+  // getContractorWithReviews (the public-facing lookup), this has no status
+  // gate -- a pending, rejected, or suspended contractor still needs to see
+  // their own dashboard, including any reviews they already have.
+  const { data: reviewRows, error: reviewsError } = await supabase
+    .from("reviews")
+    .select("*")
+    .eq("contractor_id", data.id)
+    .order("created_at", { ascending: false });
+  if (reviewsError) throw new Error("Could not load reviews: " + reviewsError.message);
+
+  const reviews = (reviewRows || []).map((r) => ({
+    id: r.id,
+    contractorId: r.contractor_id,
+    homeownerId: r.homeowner_id,
+    jobId: r.job_id,
+    rating: r.rating,
+    text: r.text_review || "",
+    createdAt: r.created_at,
+  }));
+
+  return rowToContractor(data, reviews);
 }
 
 async function createContractorForAuthUser(authUser, contractor) {
