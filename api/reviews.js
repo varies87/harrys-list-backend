@@ -189,6 +189,20 @@ async function getThumbsUpStatus(contractorId, homeownerId) {
   return { alreadyThumbsUpped: !!data };
 }
 
+/**
+ * All contractor IDs a given homeowner has thumbs-upped. Used to power
+ * "share a contractor you like" -- thumbs-up is the one existing, actually-
+ * used like/save signal, so it's what that feature is built on.
+ */
+async function listThumbsUppedContractorIds(homeownerId) {
+  const { data, error } = await supabase
+    .from("thumbs_up")
+    .select("contractor_id")
+    .eq("homeowner_id", toId(homeownerId));
+  if (error) throw new Error("Could not load thumbs-upped contractors: " + error.message);
+  return (data || []).map((r) => r.contractor_id);
+}
+
 async function handleReviewsRequest(body, req) {
   const { action } = body || {};
 
@@ -248,6 +262,12 @@ async function handleReviewsRequest(body, req) {
       // homeownerId comes from the verified session, not the request body.
       const review = await createReview({ contractorId, homeownerId, jobId, rating, text: body.text });
       return { statusCode: 200, body: { review } };
+    }
+
+    if (action === "listThumbsUppedByMe") {
+      if (!homeownerId) return { statusCode: 403, body: { error: "No homeowner profile found for this account." } };
+      const contractorIds = await listThumbsUppedContractorIds(homeownerId);
+      return { statusCode: 200, body: { contractorIds } };
     }
 
     if (action === "toggleThumbsUp") {
