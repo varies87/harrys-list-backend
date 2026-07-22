@@ -79,6 +79,7 @@ function rowToJob(row) {
     reportedAt: row.created_at,
     confirmedAt: row.confirmed_at || undefined,
     disputeNote: row.dispute_note || undefined,
+    invoiceViewedAt: row.invoice_viewed_at || null,
     feePaid: !!row.fee_paid,
     feePaidAt: row.fee_paid_at || undefined,
   };
@@ -370,16 +371,40 @@ async function getJobAmountHistory(jobId) {
   }));
 }
 
+/**
+ * Marks that the homeowner has actually opened the invoice (not just that
+ * the job appeared in their account) -- called when they click "View
+ * invoice". Only sets the timestamp once; a second view doesn't reset it.
+ * This is what locks out direct contractor edits on a pending_confirmation
+ * job (see editReportedAmount).
+ */
+async function markInvoiceViewed(jobId) {
+  const { error } = await supabase
+    .from("completed_jobs")
+    .update({ invoice_viewed_at: new Date().toISOString() })
+    .eq("id", toId(jobId))
+    .is("invoice_viewed_at", null);
+  if (error) throw new Error("Could not mark invoice viewed: " + error.message);
+}
+
 async function editReportedAmount(jobId, newAmount, lowReportReason) {
   const { data: existing, error: lookupError } = await supabase
     .from("completed_jobs")
-    .select("id, status, quoted_amount, reported_amount, dispute_note")
+    .select("id, status, quoted_amount, reported_amount, dispute_note, invoice_viewed_at")
     .eq("id", toId(jobId))
     .maybeSingle();
   if (lookupError) throw new Error("Could not look up job: " + lookupError.message);
   if (!existing) throw new Error("Job not found.");
   if (existing.status !== "pending_confirmation" && existing.status !== "disputed") {
     throw new Error("This job's amount can no longer be edited -- it has already been confirmed.");
+  }
+  // Locked once the homeowner has actually opened the invoice -- but only
+  // for the pre-decision "pending_confirmation" case. A "disputed" job is
+  // always editable regardless of viewed_at: that status only exists
+  // because the homeowner already viewed it and objected, and correcting
+  // the amount in response to their dispute is the whole point of that flow.
+  if (existing.status === "pending_confirmation" && existing.invoice_viewed_at) {
+    throw new Error("The homeowner has already viewed this invoice, so it can no longer be edited directly. Wait for them to confirm or dispute it.");
   }
 
   const quotedAmount = existing.quoted_amount != null ? Number(existing.quoted_amount) : null;
@@ -880,6 +905,12 @@ async function handleJobsRequest(body, req) {
       if (!body.jobId) return { statusCode: 400, body: { error: "jobId is required." } };
       const revisions = await getJobAmountHistory(body.jobId);
       return { statusCode: 200, body: { revisions } };
+    }
+
+    if (action === "markInvoiceViewed") {
+      if (!body.jobId) return { statusCode: 400, body: { error: "jobId is required." } };
+      await markInvoiceViewed(body.jobId);
+      return { statusCode: 200, body: { marked: true } };
     }
 
     if (action === "editReportedAmount") {
