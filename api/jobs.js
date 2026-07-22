@@ -387,7 +387,7 @@ async function markInvoiceViewed(jobId) {
   if (error) throw new Error("Could not mark invoice viewed: " + error.message);
 }
 
-async function editReportedAmount(jobId, newAmount, lowReportReason) {
+async function editReportedAmount(jobId, newAmount, lowReportReason, invoiceLineItems, invoiceNote) {
   const { data: existing, error: lookupError } = await supabase
     .from("completed_jobs")
     .select("id, status, quoted_amount, reported_amount, dispute_note, invoice_viewed_at")
@@ -424,15 +424,22 @@ async function editReportedAmount(jobId, newAmount, lowReportReason) {
     if (historyError) throw new Error("Could not save invoice history: " + historyError.message);
   }
 
+  const updates = {
+    reported_amount: newAmount,
+    is_low_report: low,
+    low_report_reason: low ? lowReportReason : null,
+    status: "pending_confirmation",
+    dispute_note: null,
+  };
+  // Only touch these columns when actually provided -- an older-style call
+  // passing just the amount must never silently wipe existing line items
+  // or the note to null.
+  if (invoiceLineItems !== undefined) updates.invoice_line_items = invoiceLineItems || null;
+  if (invoiceNote !== undefined) updates.invoice_note = invoiceNote || null;
+
   const { data, error } = await supabase
     .from("completed_jobs")
-    .update({
-      reported_amount: newAmount,
-      is_low_report: low,
-      low_report_reason: low ? lowReportReason : null,
-      status: "pending_confirmation",
-      dispute_note: null,
-    })
+    .update(updates)
     .eq("id", toId(jobId))
     .select()
     .single();
@@ -929,7 +936,7 @@ async function handleJobsRequest(body, req) {
       if (String(job.contractor_id) !== String(contractorId)) {
         return { statusCode: 403, body: { error: "This job doesn't belong to your account." } };
       }
-      const edited = await editReportedAmount(body.jobId, body.newAmount, body.lowReportReason);
+      const edited = await editReportedAmount(body.jobId, body.newAmount, body.lowReportReason, body.invoiceLineItems, body.invoiceNote);
       return { statusCode: 200, body: { job: edited } };
     }
 
